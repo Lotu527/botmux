@@ -2797,12 +2797,19 @@ async function cmdSend(rest: string[]): Promise<void> {
   // addressing to go to the last caller in the shared oncall workspace.
   const oncallEntry = !sendTopLevel && !overrideChatId && s.chatId
     ? findOncallChatForAnyBot(s.chatId) : undefined;
+
+  const hookContext = {
+    sessionId: sid,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    title: s.title,
+  };
   // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
   // decision point. Used for file attachments (always plain in chat scope).
   const dispatch = (content: string, msgType: string): Promise<string> =>
     (sendTopLevel || isChatScope)
-      ? sendMessage(appId, targetChatId, content, msgType)
-      : replyMessage(appId, s.rootMessageId, content, msgType, true);
+      ? sendMessage(appId, targetChatId, content, msgType, undefined, hookContext)
+      : replyMessage(appId, s.rootMessageId, content, msgType, true, undefined, hookContext);
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
