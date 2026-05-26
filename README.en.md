@@ -439,9 +439,9 @@ Hook payloads are written to stdin. Common fields include `event`, `emittedAt`, 
 | Event | Extra fields |
 |-------|--------------|
 | `session.start` | `reason`, `pid`, `adoptedFrom` |
-| `session.exit` | `reason`, `code`, `signal`, `killedBy` |
+| `session.exit` | `reason`, `code` (worker exit path; `null` for `dashboard_close`) |
 | `session.idle` | `prevState`, `newState`, `transition`, `source` |
-| `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `message` |
+| `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `multiSelect`, `message` |
 
 `filter` currently supports `chatId` and `senderOpenId`. By default `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to 600 characters with `xxxLength` / `xxxTruncated` metadata. Events listed in `redact.fullContentEvents` keep full content.
 

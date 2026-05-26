@@ -433,9 +433,9 @@ botmux 可以在关键生命周期事件发生时异步调用外部命令。配�
 | 事件 | 额外字段 |
 |------|----------|
 | `session.start` | `reason`、`pid`、`adoptedFrom` |
-| `session.exit` | `reason`、`code`、`signal`、`killedBy` |
+| `session.exit` | `reason`、`code`（worker 退出路径；`dashboard_close` 路径为 `null`） |
 | `session.idle` | `prevState`、`newState`、`transition`、`source` |
-| `session.requires_attention` | `reason`、`description`、`optionsCount`、`optionsPreview`、`message` |
+| `session.requires_attention` | `reason`、`description`、`optionsCount`、`optionsPreview`、`multiSelect`、`message` |
 
 `filter` 目前支持 `chatId` 和 `senderOpenId`。默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 600 字符，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` allowlist 内的事件会透传全文。
 
