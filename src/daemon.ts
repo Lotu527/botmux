@@ -15,6 +15,7 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { autoBindOncallFromDefault } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
+import { emitHookEvent } from './services/hook-runner.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -285,6 +286,11 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  const hookContext = ds ? {
+    sessionId: ds.session.sessionId,
+    scope: ds.scope,
+    anchor: sessionAnchorId(ds),
+  } : undefined;
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
@@ -306,14 +312,14 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
       const mode = await getChatMode(appId, chatId, { forceRefresh: true });
       if (mode === 'topic') {
         logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
-        return replyMessage(appId, ds.session.rootMessageId, content, msgType, true);
+        return replyMessage(appId, ds.session.rootMessageId, content, msgType, true, undefined, hookContext);
       }
     }
-    return sendMessage(appId, chatId, content, msgType);
+    return sendMessage(appId, chatId, content, msgType, undefined, hookContext);
   }
 
   // Thread-scope (or unknown / legacy): reply in thread.
-  return replyMessage(appId, anchor, content, msgType, true);
+  return replyMessage(appId, anchor, content, msgType, true, undefined, hookContext);
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -1713,6 +1719,18 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const botCfg = getBot(larkAppId).config;
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
+  emitHookEvent('topic.new', {
+    larkAppId,
+    chatId,
+    chatType,
+    scope,
+    anchor,
+    messageId,
+    senderOpenId,
+    senderType: parsed.senderType,
+    msgType: parsed.msgType,
+    content,
+  });
 
   if (await handleWorkflowCommandIfAny(cmdContent, anchor, chatId, larkAppId, senderOpenId)) {
     return;
@@ -1984,6 +2002,22 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     : '';
 
   const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + parsed.content;
+  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
+  emitHookEvent('thread.reply', {
+    larkAppId,
+    chatId: ctxChatId,
+    chatType: ctxChatType,
+    scope,
+    anchor,
+    messageId: parsed.messageId,
+    rootId: parsed.rootId,
+    parentId: parsed.parentId,
+    senderOpenId: senderOpenIdForPrefix,
+    senderType: parsed.senderType,
+    msgType: parsed.msgType,
+    sessionId: existingHookSession?.session.sessionId,
+    content: parsed.content,
+  });
   if (isForeignBot) {
     logger.info(
       `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +

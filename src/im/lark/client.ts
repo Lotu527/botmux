@@ -5,6 +5,7 @@ import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
+import { emitHookEvent } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
@@ -72,7 +73,7 @@ const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
  * idempotencyKey here so retries don't re-send.  Existing callers omit
  * the param and get exactly the pre-Step-6 behavior.
  */
-export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string): Promise<string> {
+export async function sendMessage(larkAppId: string, chatId: string, content: string, msgType: string = 'text', uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -102,6 +103,15 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
   const messageId = res.data?.message_id;
   if (!messageId) throw new Error('No message_id in response');
   logger.info(`Sent message ${messageId} to chat ${chatId}`);
+  emitHookEvent('outbound.send', {
+    ...hookContext,
+    larkAppId,
+    chatId,
+    messageId,
+    msgType,
+    uuid,
+    content,
+  });
   return messageId;
 }
 
@@ -112,7 +122,7 @@ export async function sendMessage(larkAppId: string, chatId: string, content: st
  * spike report §1.4 for the reply-specific test results, including the
  * cross-parent dedupe behavior that informs the inputHash design.
  */
-export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string): Promise<string> {
+export async function replyMessage(larkAppId: string, messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false, uuid?: string, hookContext?: Record<string, unknown>): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -142,6 +152,16 @@ export async function replyMessage(larkAppId: string, messageId: string, content
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
   logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
+  emitHookEvent('outbound.reply', {
+    ...hookContext,
+    larkAppId,
+    messageId,
+    replyId,
+    msgType,
+    replyInThread,
+    uuid,
+    content,
+  });
   return replyId;
 }
 

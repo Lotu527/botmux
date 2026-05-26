@@ -1,5 +1,6 @@
 import { Cron } from 'croner';
 import * as scheduleStore from '../services/schedule-store.js';
+import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule } from '../types.js';
@@ -18,6 +19,22 @@ const TICK_INTERVAL_MS = 30_000;          // poll every 30s
 const ONESHOT_GRACE_SECONDS = 120;        // one-shots fire even if <2min late
 const MIN_GRACE_SECONDS = 120;            // catch-up window lower bound
 const MAX_GRACE_SECONDS = 2 * 60 * 60;    // catch-up window upper bound (2h)
+
+function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', error?: unknown): void {
+  emitHookEvent('schedule.fired', {
+    id: task.id,
+    name: task.name,
+    schedule: task.schedule,
+    status,
+    error: error ? (error instanceof Error ? error.message : String(error)) : undefined,
+    chatId: task.chatId,
+    rootMessageId: task.rootMessageId,
+    chatType: task.chatType,
+    scope: task.scope,
+    larkAppId: task.larkAppId,
+    runAt: Date.now(),
+  });
+}
 
 export function setExecuteCallback(cb: (task: ScheduledTask) => Promise<void>): void {
   executeCallback = cb;
@@ -356,6 +373,7 @@ async function tick(): Promise<void> {
             type: 'schedule.fired',
             body: { id: taskId, runAt: Date.now(), status: 'ok' },
           });
+          emitScheduleFiredHook(task, 'ok');
         })
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
@@ -369,6 +387,7 @@ async function tick(): Promise<void> {
               error: err instanceof Error ? err.message : String(err),
             },
           });
+          emitScheduleFiredHook(task, 'error', err);
         });
     }
   }
@@ -511,6 +530,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'ok' },
       });
+      emitScheduleFiredHook(task, 'ok');
     },
     err => {
       const msg = err instanceof Error ? err.message : String(err);
@@ -519,6 +539,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },
       });
+      emitScheduleFiredHook(task, 'error', err);
     },
   );
   return { ok: true };
