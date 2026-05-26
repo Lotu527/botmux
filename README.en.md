@@ -404,6 +404,47 @@ Two creation paths are covered above in [Scheduled Tasks](#scheduled-tasks); bel
 
 **Execution behavior**: the task fires inside the **original thread where it was created** — no new topic per run. Working directory is preserved. If the original session is still alive, the prompt is injected into it; otherwise a fresh worker spawns bound to the same thread root.
 
+### Lifecycle Hooks
+
+botmux can invoke external commands asynchronously when lifecycle events happen. The default config file is `~/.botmux/data/hooks.json`; override it with `BOTMUX_HOOKS_FILE`, or provide inline JSON with `BOTMUX_HOOKS_JSON`. Hook failures, timeouts, and missing commands are logged only; they never block the main botmux flow.
+
+```json
+[
+  {
+    "event": "session.requires_attention",
+    "command": "/usr/local/bin/AmazingIslandHooks notify --kind interactive --payload -",
+    "timeoutMs": 5000,
+    "filter": { "chatId": "oc_xxx" },
+    "redact": { "fullContentEvents": ["session.requires_attention"] }
+  }
+]
+```
+
+Supported events:
+
+| Event | When it fires |
+|-------|---------------|
+| `topic.new` | A new topic / @mention is received |
+| `thread.reply` | A reply is received in an existing thread |
+| `outbound.send` | botmux successfully sends a chat message |
+| `outbound.reply` | botmux successfully replies in a thread |
+| `schedule.fired` | A scheduled task finishes |
+| `session.start` | A worker or adopt worker starts successfully |
+| `session.exit` | A worker exits, crashes, or is closed (daemon shutdown is silent by default) |
+| `session.idle` | A session enters or leaves idle; deduped for 10s by session + state |
+| `session.requires_attention` | A TUI prompt or worker `user_notify` needs user action |
+
+Hook payloads are written to stdin. Common fields include `event`, `emittedAt`, `sessionId`, `chatId`, `chatType`, `larkAppId`, `scope`, `anchor`, `title`, `cliId`, `workingDir`, `hasHistory`, `spawnedAt`, and `lastMessageAt`. Session events add:
+
+| Event | Extra fields |
+|-------|--------------|
+| `session.start` | `reason`, `pid`, `adoptedFrom` |
+| `session.exit` | `reason`, `code`, `signal`, `killedBy` |
+| `session.idle` | `prevState`, `newState`, `transition`, `source` |
+| `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `message` |
+
+`filter` currently supports `chatId` and `senderOpenId`. By default `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to 600 characters with `xxxLength` / `xxxTruncated` metadata. Events listed in `redact.fullContentEvents` keep full content.
+
 ---
 
 ## Configuration

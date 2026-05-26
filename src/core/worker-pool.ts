@@ -27,6 +27,7 @@ import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
+import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
@@ -797,6 +798,7 @@ export async function closeSession(
         type: 'session.exited',
         body: { sessionId, reason: 'dashboard_close' },
       });
+      emitSessionLifecycleHook(ds, 'session.exit', { reason: 'dashboard_close' });
     }
   }
 
@@ -936,6 +938,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   dashboardEventBus.publish({
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
+  });
+  emitSessionLifecycleHook(ds, 'session.start', {
+    reason: resume ? 'resume' : 'worker_spawn',
+    pid: worker.pid ?? null,
   });
 }
 
@@ -1145,6 +1151,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               },
             },
           });
+          emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+            source: 'screen_update',
+            content: msg.content,
+          });
         }
 
         // Bot opted out of the streaming card — dashboard SSE above already got
@@ -1241,8 +1251,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
         ds.currentImageKey = msg.imageKey;
+        const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+          source: 'screenshot_uploaded',
+          imageKey: msg.imageKey,
+          content: ds.lastScreenContent ?? '',
+        });
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
@@ -1280,6 +1296,18 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         ds.tuiPromptOptions = msg.options;
         ds.tuiPromptMultiSelect = msg.multiSelect;
         ds.tuiToggledIndices = [];
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'tui_prompt',
+          description: msg.description,
+          optionsCount: msg.options.length,
+          optionsPreview: msg.options.slice(0, 5).map(option => ({
+            text: option.text,
+            label: option.label,
+            type: option.type,
+            selected: option.selected,
+          })),
+          multiSelect: msg.multiSelect,
+        });
         const prevTuiTurnTitle = ds.currentTurnTitle;
         ds.currentTurnTitle = msg.description;  // store for card PATCH on toggle
         if (prevTuiTurnTitle !== ds.currentTurnTitle) {
@@ -1408,6 +1436,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'user_notify',
+          message: msg.message,
+        });
         try {
           await cb.sessionReply(sessionAnchorId(ds), msg.message, 'text', ds.larkAppId);
         } catch (err: any) {
@@ -1481,6 +1513,10 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           sessionId: ds.session.sessionId,
           reason: code === 0 ? 'graceful' : `exit_code_${code}`,
         },
+      });
+      emitSessionLifecycleHook(ds, 'session.exit', {
+        reason: code === 0 ? 'graceful' : `exit_code_${code}`,
+        code,
       });
     }
   });
@@ -1695,6 +1731,11 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   dashboardEventBus.publish({
     type: 'session.spawned',
     body: { session: composeRowFromActive(ds) },
+  });
+  emitSessionLifecycleHook(ds, 'session.start', {
+    reason: opts?.restoredFromMetadata ? 'adopt_restore' : 'adopt',
+    pid: worker.pid ?? null,
+    adoptedFrom: adopted.tmuxTarget,
   });
 }
 

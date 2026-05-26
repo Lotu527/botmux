@@ -7,6 +7,7 @@ import {
   filterMatches,
   loadHookConfigs,
   parseHookCommand,
+  prepareHookPayload,
   runHookCommandForTest,
   type HookConfig,
 } from '../src/services/hook-runner.js';
@@ -71,6 +72,74 @@ describe('loadHookConfigs', () => {
     expect(loadHookConfigs({ dataDir: tmpDir, env: {} })).toEqual([
       { event: 'outbound.reply', command: '/bin/echo ok', timeoutMs: -1 },
     ]);
+  });
+
+  it('normalizes redact full-content allowlist entries', () => {
+    writeFileSync(join(tmpDir, 'hooks.json'), JSON.stringify([
+      {
+        event: 'session.requires_attention',
+        command: '/bin/echo attention',
+        redact: { fullContentEvents: ['session.requires_attention', 'unknown'] },
+      },
+    ]));
+
+    expect(loadHookConfigs({ dataDir: tmpDir, env: {} })).toEqual([
+      {
+        event: 'session.requires_attention',
+        command: '/bin/echo attention',
+        redact: { fullContentEvents: ['session.requires_attention'] },
+      },
+    ]);
+  });
+});
+
+describe('prepareHookPayload', () => {
+  it('truncates content-like fields by default and preserves length metadata', () => {
+    const longContent = 'x'.repeat(650);
+
+    const payload = prepareHookPayload(
+      { event: 'session.idle', command: '/bin/echo idle' },
+      {
+        event: 'session.idle',
+        content: longContent,
+        message: 'm'.repeat(601),
+        description: 'short',
+      },
+    );
+
+    expect(payload.content).toHaveLength(600);
+    expect(payload.contentLength).toBe(650);
+    expect(payload.contentTruncated).toBe(true);
+    expect(payload.message).toHaveLength(600);
+    expect(payload.messageLength).toBe(601);
+    expect(payload.messageTruncated).toBe(true);
+    expect(payload.description).toBe('short');
+    expect(payload.descriptionLength).toBe(5);
+    expect(payload.descriptionTruncated).toBe(false);
+  });
+
+  it('keeps full content for allowlisted events', () => {
+    const longContent = 'x'.repeat(650);
+
+    const payload = prepareHookPayload(
+      {
+        event: 'session.requires_attention',
+        command: '/bin/echo attention',
+        redact: { fullContentEvents: ['session.requires_attention'] },
+      },
+      {
+        event: 'session.requires_attention',
+        content: longContent,
+        message: 'm'.repeat(601),
+      },
+    );
+
+    expect(payload.content).toBe(longContent);
+    expect(payload.contentLength).toBe(650);
+    expect(payload.contentTruncated).toBe(false);
+    expect(payload.message).toBe('m'.repeat(601));
+    expect(payload.messageLength).toBe(601);
+    expect(payload.messageTruncated).toBe(false);
   });
 });
 

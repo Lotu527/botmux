@@ -398,6 +398,47 @@ botmux autostart enable
 
 **任务执行行为**：到点会在**创建任务的原话题**内续一条消息并执行，不会另开 thread。工作目录与创建时一致。如果原话题的会话还活着，prompt 直接注入现有会话（不另起 worker）。
 
+### Lifecycle Hooks
+
+botmux 可以在关键生命周期事件发生时异步调用外部命令。配置文件默认位于 `~/.botmux/data/hooks.json`，也可用 `BOTMUX_HOOKS_FILE` 指定路径，或用 `BOTMUX_HOOKS_JSON` 直接传 JSON。hook 失败、超时或命令不存在只会写日志，不会阻塞 botmux 主流程。
+
+```json
+[
+  {
+    "event": "session.requires_attention",
+    "command": "/usr/local/bin/AmazingIslandHooks notify --kind interactive --payload -",
+    "timeoutMs": 5000,
+    "filter": { "chatId": "oc_xxx" },
+    "redact": { "fullContentEvents": ["session.requires_attention"] }
+  }
+]
+```
+
+支持事件：
+
+| 事件 | 触发时机 |
+|------|----------|
+| `topic.new` | 收到新话题 / @mention |
+| `thread.reply` | 收到已有话题回复 |
+| `outbound.send` | botmux 发送普通消息成功 |
+| `outbound.reply` | botmux 回复话题消息成功 |
+| `schedule.fired` | 定时任务执行完成 |
+| `session.start` | worker / adopt worker 启动成功 |
+| `session.exit` | worker 退出、崩溃或会话被关闭（daemon shutdown 默认静音） |
+| `session.idle` | session 进入或离开 idle 状态，按 session + 状态 10s 去重 |
+| `session.requires_attention` | TUI prompt 或 worker `user_notify` 需要用户处理 |
+
+所有 payload 都会通过 stdin 写入 hook 命令，基础字段包括 `event`、`emittedAt`、`sessionId`、`chatId`、`chatType`、`larkAppId`、`scope`、`anchor`、`title`、`cliId`、`workingDir`、`hasHistory`、`spawnedAt`、`lastMessageAt`。不同事件会额外携带：
+
+| 事件 | 额外字段 |
+|------|----------|
+| `session.start` | `reason`、`pid`、`adoptedFrom` |
+| `session.exit` | `reason`、`code`、`signal`、`killedBy` |
+| `session.idle` | `prevState`、`newState`、`transition`、`source` |
+| `session.requires_attention` | `reason`、`description`、`optionsCount`、`optionsPreview`、`message` |
+
+`filter` 目前支持 `chatId` 和 `senderOpenId`。默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 600 字符，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` allowlist 内的事件会透传全文。
+
 ---
 
 ## CLI 命令

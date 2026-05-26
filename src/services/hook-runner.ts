@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -10,6 +10,10 @@ export const HOOK_EVENTS = [
   'outbound.send',
   'outbound.reply',
   'schedule.fired',
+  'session.start',
+  'session.exit',
+  'session.idle',
+  'session.requires_attention',
 ] as const;
 
 export type HookEvent = typeof HOOK_EVENTS[number];
@@ -25,6 +29,9 @@ export type HookConfig = {
   command: string;
   timeoutMs?: number;
   filter?: HookFilter;
+  redact?: {
+    fullContentEvents?: HookEvent[];
+  };
 };
 
 export type HookPayload = Record<string, unknown> & {
@@ -48,6 +55,11 @@ export type HookRunResult = {
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
+const CONTENT_PREVIEW_LIMIT = 600;
+const CONTENT_FIELDS = ['content', 'message', 'description', 'finalOutput', 'lastScreenContent'] as const;
+
+let envHookCache: { raw: string; hooks: HookConfig[] } | null = null;
+let fileHookCache: { path: string; mtimeMs: number; size: number; hooks: HookConfig[] } | null = null;
 
 function isHookEvent(value: unknown): value is HookEvent {
   return typeof value === 'string' && (HOOK_EVENTS as readonly string[]).includes(value);
@@ -84,6 +96,16 @@ function normalizeHookConfig(raw: unknown): HookConfig | null {
     if (senderOpenId) filter.senderOpenId = senderOpenId;
     if (filter.chatId || filter.senderOpenId) hook.filter = filter;
   }
+  if (rec.redact && typeof rec.redact === 'object') {
+    const redactRec = rec.redact as Record<string, unknown>;
+    const fullContentEventsRaw = Array.isArray(redactRec.fullContentEvents)
+      ? redactRec.fullContentEvents
+      : [];
+    const fullContentEvents = fullContentEventsRaw.filter(isHookEvent);
+    if (fullContentEvents.length > 0) {
+      hook.redact = { fullContentEvents };
+    }
+  }
   return hook;
 }
 
@@ -100,16 +122,51 @@ export function loadHookConfigs(opts: {
   const env = opts.env ?? process.env;
   try {
     if (env.BOTMUX_HOOKS_JSON) {
-      return readJsonHookArray(env.BOTMUX_HOOKS_JSON);
+      if (envHookCache?.raw === env.BOTMUX_HOOKS_JSON) return envHookCache.hooks;
+      const hooks = readJsonHookArray(env.BOTMUX_HOOKS_JSON);
+      envHookCache = { raw: env.BOTMUX_HOOKS_JSON, hooks };
+      return hooks;
     }
 
     const hooksPath = env.BOTMUX_HOOKS_FILE || join(opts.dataDir ?? config.session.dataDir, 'hooks.json');
     if (!existsSync(hooksPath)) return [];
-    return readJsonHookArray(readFileSync(hooksPath, 'utf-8'));
+    const stats = statSync(hooksPath);
+    if (
+      fileHookCache
+      && fileHookCache.path === hooksPath
+      && fileHookCache.mtimeMs === stats.mtimeMs
+      && fileHookCache.size === stats.size
+    ) {
+      return fileHookCache.hooks;
+    }
+    const hooks = readJsonHookArray(readFileSync(hooksPath, 'utf-8'));
+    fileHookCache = { path: hooksPath, mtimeMs: stats.mtimeMs, size: stats.size, hooks };
+    return hooks;
   } catch (err: any) {
     logger.warn(`[hooks] Failed to load hook config: ${err?.message ?? String(err)}`);
     return [];
   }
+}
+
+export function prepareHookPayload(hook: HookConfig, rawPayload: HookPayload): HookPayload {
+  const allowFullContent = !!hook.redact?.fullContentEvents?.includes(rawPayload.event);
+  const payload: HookPayload = { ...rawPayload };
+
+  for (const field of CONTENT_FIELDS) {
+    const value = payload[field];
+    if (typeof value !== 'string') continue;
+    const lengthKey = `${field}Length`;
+    const truncatedKey = `${field}Truncated`;
+    payload[lengthKey] = value.length;
+    if (allowFullContent || value.length <= CONTENT_PREVIEW_LIMIT) {
+      payload[truncatedKey] = false;
+      continue;
+    }
+    payload[field] = value.slice(0, CONTENT_PREVIEW_LIMIT);
+    payload[truncatedKey] = true;
+  }
+
+  return payload;
 }
 
 export function parseHookCommand(command: string): ParsedHookCommand {
@@ -248,7 +305,8 @@ export function emitHookEvent(event: HookEvent, body: Record<string, unknown> = 
     if (hooks.length === 0) return;
 
     for (const hook of hooks) {
-      void runHookCommand(hook, payload).then(result => {
+      const hookPayload = prepareHookPayload(hook, payload);
+      void runHookCommand(hook, hookPayload).then(result => {
         if (!result.ok) {
           logger.warn(`[hooks] ${event} hook failed: ${result.error ?? `code=${result.code} signal=${result.signal ?? 'none'}`}`);
         } else {
