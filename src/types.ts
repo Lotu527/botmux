@@ -195,6 +195,7 @@ export type WorkerToDaemon =
   | { type: 'tui_prompt_resolved'; selectedText?: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
   | { type: 'user_notify'; message: string }
+  | { type: 'pty_error'; errorId: string; message: string }
   | {
       type: 'final_output';
       content: string;

@@ -27,7 +27,7 @@ import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
-import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
+import { emitSessionLifecycleHook, emitSessionStateTransitionHook, emitSessionErrorHook } from '../services/session-lifecycle-hooks.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
@@ -1444,6 +1444,17 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           await cb.sessionReply(sessionAnchorId(ds), msg.message, 'text', ds.larkAppId);
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
+        }
+        break;
+      }
+
+      case 'pty_error': {
+        logger.warn(`[${t}] PTY error detected: ${msg.errorId} — ${msg.message}`);
+        emitSessionErrorHook(ds, msg.errorId, msg.message);
+        try {
+          await cb.sessionReply(sessionAnchorId(ds), msg.message, 'text', ds.larkAppId);
+        } catch (err: any) {
+          logger.error(`[${t}] Failed to deliver pty_error to Lark: ${err.message}`);
         }
         break;
       }

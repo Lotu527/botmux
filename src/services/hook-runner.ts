@@ -14,6 +14,7 @@ export const HOOK_EVENTS = [
   'session.exit',
   'session.idle',
   'session.requires_attention',
+  'session.error',
 ] as const;
 
 export type HookEvent = typeof HOOK_EVENTS[number];

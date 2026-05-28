@@ -6,7 +6,7 @@ import { logger } from '../utils/logger.js';
 
 type SessionLifecycleEvent = Extract<
   HookEvent,
-  'session.start' | 'session.exit' | 'session.idle' | 'session.requires_attention'
+  'session.start' | 'session.exit' | 'session.idle' | 'session.requires_attention' | 'session.error'
 >;
 
 const IDLE_DEDUP_WINDOW_MS = 10_000;
@@ -72,6 +72,14 @@ export function emitSessionStateTransitionHook(
     transition: newState === 'idle' ? 'enter' : 'exit',
     ...body,
   });
+}
+
+export function emitSessionErrorHook(
+  ds: DaemonSession,
+  errorId: string,
+  message: string,
+): boolean {
+  return emitSessionLifecycleHook(ds, 'session.error', { errorId, message });
 }
 
 export function __testOnly_resetSessionLifecycleHooks(): void {

@@ -408,17 +408,87 @@ Two creation paths are covered above in [Scheduled Tasks](#scheduled-tasks); bel
 
 botmux can invoke external commands asynchronously when lifecycle events happen. The default config file is `~/.botmux/data/hooks.json`; override it with `BOTMUX_HOOKS_FILE`, or provide inline JSON with `BOTMUX_HOOKS_JSON`. Hook failures, timeouts, and missing commands are logged only; they never block the main botmux flow.
 
+#### Quick verification: append payloads to a local log
+
+The repository includes copy-and-run sample commands. Use an absolute command path in `hooks.json`, then trigger any matching event and watch the payloads arrive:
+
+```bash
+chmod +x examples/hooks/echo-to-log.sh
+HOOK_CMD="$(pwd)/examples/hooks/echo-to-log.sh"
+mkdir -p ~/.botmux/data
+cat > ~/.botmux/data/hooks.json <<JSON
+[
+  {
+    "event": "session.requires_attention",
+    "command": "$HOOK_CMD",
+    "timeoutMs": 5000
+  }
+]
+JSON
+
+tail -f /tmp/botmux-hook.log
+```
+
+`examples/hooks/echo-to-log.sh` is only five lines:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+log="${BOTMUX_HOOK_LOG:-/tmp/botmux-hook.log}"
+printf '\n--- %s %s ---\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${BOTMUX_HOOK_EVENT:-unknown}" >> "$log"
+cat >> "$log"
+```
+
+#### More generic examples
+
+macOS Notification Center:
+
 ```json
 [
   {
     "event": "session.requires_attention",
-    "command": "/usr/local/bin/AmazingIslandHooks notify --kind interactive --payload -",
+    "command": "/absolute/path/to/examples/hooks/osascript-notify.sh",
+    "timeoutMs": 5000
+  }
+]
+```
+
+Slack / HTTP webhook:
+
+```json
+[
+  {
+    "event": "session.exit",
+    "command": "/absolute/path/to/examples/hooks/http-webhook.sh https://hooks.slack.com/services/XXX/YYY/ZZZ",
+    "timeoutMs": 5000
+  }
+]
+```
+
+All three scripts read the botmux payload from stdin. Copy them to `~/.local/bin/`, rename them, or use them as starting points for your own integration.
+
+#### Config schema
+
+```json
+[
+  {
+    "event": "session.requires_attention",
+    "command": "/absolute/path/to/your-hook-command --flag value",
     "timeoutMs": 5000,
     "filter": { "chatId": "oc_xxx" },
     "redact": { "fullContentEvents": ["session.requires_attention"] }
   }
 ]
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event` | string | Required. Event name to subscribe to; see the event table below |
+| `command` | string | Required. External executable command; arguments are supported, but no shell is used |
+| `timeoutMs` | number | Optional. Defaults to 5000; timeout sends `SIGTERM`, then `SIGKILL` as a fallback |
+| `filter.chatId` | string or string[] | Optional. Match only specific Lark chats / thread chats |
+| `filter.senderOpenId` | string or string[] | Optional. Match only specific sender open_ids; `sender_open_id` is also accepted |
+| `redact.fullContentEvents` | string[] | Optional. Long text is truncated by default; allowlisted events keep full content |
 
 Supported events:
 
@@ -434,16 +504,25 @@ Supported events:
 | `session.idle` | A session enters or leaves idle; deduped for 10s by session + state |
 | `session.requires_attention` | A TUI prompt or worker `user_notify` needs user action |
 
-Hook payloads are written to stdin. Common fields include `event`, `emittedAt`, `sessionId`, `chatId`, `chatType`, `larkAppId`, `scope`, `anchor`, `title`, `cliId`, `workingDir`, `hasHistory`, `spawnedAt`, and `lastMessageAt`. Session events add:
+Hook payloads are written to stdin. Every payload includes `event` and `emittedAt`; contextual fields can include `sessionId`, `chatId`, `chatType`, `larkAppId`, `scope`, `anchor`, `title`, `cliId`, `workingDir`, `hasHistory`, `spawnedAt`, and `lastMessageAt`. Events add:
 
 | Event | Extra fields |
 |-------|--------------|
+| `topic.new` | `messageId`, `senderOpenId`, `senderType`, `msgType`, `content` |
+| `thread.reply` | `messageId`, `rootId`, `parentId`, `senderOpenId`, `senderType`, `msgType`, `content` |
+| `outbound.send` | `messageId`, `msgType`, `uuid`, `content` |
+| `outbound.reply` | `messageId`, `replyId`, `msgType`, `replyInThread`, `uuid`, `content` |
+| `schedule.fired` | `id`, `name`, `schedule`, `status`, `error`, `rootMessageId`, `runAt` |
 | `session.start` | `reason`, `pid`, `adoptedFrom` |
 | `session.exit` | `reason`, `code` (worker exit path; `null` for `dashboard_close`) |
 | `session.idle` | `prevState`, `newState`, `transition`, `source` |
 | `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `multiSelect`, `message` |
 
 `filter` currently supports `chatId` and `senderOpenId`. By default `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to 600 characters with `xxxLength` / `xxxTruncated` metadata. Events listed in `redact.fullContentEvents` keep full content.
+
+#### Build your own
+
+A hook command can be any executable: bash, Python, Node, a Go binary, an internal company CLI, or an HTTP forwarder. botmux writes one JSON payload to stdin and also sets `BOTMUX_HOOK_EVENT`. Exit 0 means success; non-zero exits, timeouts, and missing commands are logged only and never affect normal message delivery, scheduled tasks, or session lifecycle handling.
 
 ---
 

@@ -402,17 +402,87 @@ botmux autostart enable
 
 botmux 可以在关键生命周期事件发生时异步调用外部命令。配置文件默认位于 `~/.botmux/data/hooks.json`，也可用 `BOTMUX_HOOKS_FILE` 指定路径，或用 `BOTMUX_HOOKS_JSON` 直接传 JSON。hook 失败、超时或命令不存在只会写日志，不会阻塞 botmux 主流程。
 
+#### 快速验证：写入本地日志
+
+仓库内置了可直接复制的示例脚本。先把 hook 命令写成绝对路径，再触发任意会话事件即可看到 payload：
+
+```bash
+chmod +x examples/hooks/echo-to-log.sh
+HOOK_CMD="$(pwd)/examples/hooks/echo-to-log.sh"
+mkdir -p ~/.botmux/data
+cat > ~/.botmux/data/hooks.json <<JSON
+[
+  {
+    "event": "session.requires_attention",
+    "command": "$HOOK_CMD",
+    "timeoutMs": 5000
+  }
+]
+JSON
+
+tail -f /tmp/botmux-hook.log
+```
+
+`examples/hooks/echo-to-log.sh` 的完整逻辑只有 5 行：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+log="${BOTMUX_HOOK_LOG:-/tmp/botmux-hook.log}"
+printf '\n--- %s %s ---\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${BOTMUX_HOOK_EVENT:-unknown}" >> "$log"
+cat >> "$log"
+```
+
+#### 更多通用示例
+
+macOS Notification Center：
+
 ```json
 [
   {
     "event": "session.requires_attention",
-    "command": "/usr/local/bin/AmazingIslandHooks notify --kind interactive --payload -",
+    "command": "/absolute/path/to/examples/hooks/osascript-notify.sh",
+    "timeoutMs": 5000
+  }
+]
+```
+
+Slack / HTTP webhook：
+
+```json
+[
+  {
+    "event": "session.exit",
+    "command": "/absolute/path/to/examples/hooks/http-webhook.sh https://hooks.slack.com/services/XXX/YYY/ZZZ",
+    "timeoutMs": 5000
+  }
+]
+```
+
+这三个脚本都只从 stdin 读取 botmux payload；你可以把它们复制到 `~/.local/bin/`、改名后在 `hooks.json` 中引用。
+
+#### 配置格式
+
+```json
+[
+  {
+    "event": "session.requires_attention",
+    "command": "/absolute/path/to/your-hook-command --flag value",
     "timeoutMs": 5000,
     "filter": { "chatId": "oc_xxx" },
     "redact": { "fullContentEvents": ["session.requires_attention"] }
   }
 ]
 ```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `event` | string | 必填。要订阅的事件名，见下方事件表 |
+| `command` | string | 必填。外部可执行命令；支持带参数，但不会经过 shell 执行 |
+| `timeoutMs` | number | 可选。默认 5000；超时后先 `SIGTERM`，再兜底 `SIGKILL` |
+| `filter.chatId` | string 或 string[] | 可选。只匹配指定飞书群 / 话题所在 chat |
+| `filter.senderOpenId` | string 或 string[] | 可选。只匹配指定发送者 open_id；也接受 `sender_open_id` |
+| `redact.fullContentEvents` | string[] | 可选。默认会截断长文本；列入 allowlist 的事件透传全文 |
 
 支持事件：
 
@@ -428,16 +498,25 @@ botmux 可以在关键生命周期事件发生时异步调用外部命令。配�
 | `session.idle` | session 进入或离开 idle 状态，按 session + 状态 10s 去重 |
 | `session.requires_attention` | TUI prompt 或 worker `user_notify` 需要用户处理 |
 
-所有 payload 都会通过 stdin 写入 hook 命令，基础字段包括 `event`、`emittedAt`、`sessionId`、`chatId`、`chatType`、`larkAppId`、`scope`、`anchor`、`title`、`cliId`、`workingDir`、`hasHistory`、`spawnedAt`、`lastMessageAt`。不同事件会额外携带：
+所有 payload 都会通过 stdin 写入 hook 命令。每份 payload 都包含 `event`、`emittedAt`；事件上下文可包含 `sessionId`、`chatId`、`chatType`、`larkAppId`、`scope`、`anchor`、`title`、`cliId`、`workingDir`、`hasHistory`、`spawnedAt`、`lastMessageAt`。不同事件会额外携带：
 
 | 事件 | 额外字段 |
 |------|----------|
+| `topic.new` | `messageId`、`senderOpenId`、`senderType`、`msgType`、`content` |
+| `thread.reply` | `messageId`、`rootId`、`parentId`、`senderOpenId`、`senderType`、`msgType`、`content` |
+| `outbound.send` | `messageId`、`msgType`、`uuid`、`content` |
+| `outbound.reply` | `messageId`、`replyId`、`msgType`、`replyInThread`、`uuid`、`content` |
+| `schedule.fired` | `id`、`name`、`schedule`、`status`、`error`、`rootMessageId`、`runAt` |
 | `session.start` | `reason`、`pid`、`adoptedFrom` |
 | `session.exit` | `reason`、`code`（worker 退出路径；`dashboard_close` 路径为 `null`） |
 | `session.idle` | `prevState`、`newState`、`transition`、`source` |
 | `session.requires_attention` | `reason`、`description`、`optionsCount`、`optionsPreview`、`multiSelect`、`message` |
 
 `filter` 目前支持 `chatId` 和 `senderOpenId`。默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 600 字符，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` allowlist 内的事件会透传全文。
+
+#### Build your own
+
+hook 命令可以是任意 executable：bash / Python / Node / Go 二进制、公司内部 CLI、HTTP 转发器都可以。botmux 会用 stdin 写入一份 JSON payload，并额外设置环境变量 `BOTMUX_HOOK_EVENT`。命令 exit 0 视为成功，非 0 / 超时 / 找不到命令只会写 botmux 日志，不会影响原本的收发消息、定时任务或 session 生命周期。
 
 ---
 

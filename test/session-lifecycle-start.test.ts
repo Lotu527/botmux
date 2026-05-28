@@ -83,6 +83,7 @@ vi.mock('../src/core/dashboard-rows.js', () => ({
 vi.mock('../src/skills/installer.js', () => ({
   ensureSkills: vi.fn(),
   ensureAskSkill: vi.fn(),
+  removeGlobalBotmuxSkills: vi.fn(),
 }));
 
 vi.mock('../src/adapters/cli/claude-code.js', () => ({
