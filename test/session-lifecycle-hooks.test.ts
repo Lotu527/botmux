@@ -251,7 +251,7 @@ describe('worker-pool lifecycle hook integration', () => {
     worker.emit('message', {
       type: 'tui_prompt',
       description: 'Approve command?',
-      options: [{ text: 'Yes', selected: false }],
+      options: [{ text: 'Yes', label: 'yes', type: 'choice', selected: false }],
       multiSelect: false,
     });
     worker.emit('message', { type: 'user_notify', message: 'Need manual input' });
@@ -261,6 +261,7 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'tui_prompt',
       description: 'Approve command?',
       optionsCount: 1,
+      optionsPreview: [{ text: 'Yes', label: 'yes', type: 'choice', selected: false }],
     }));
     expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
       reason: 'user_notify',

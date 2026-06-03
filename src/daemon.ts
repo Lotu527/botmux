@@ -2419,6 +2419,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // Mark this process as the daemon so hook-runner keeps timers unref'd
+  // (daemon event loop must not be held open by hook timeouts). CLI processes
+  // that spawn hooks leave this unset so their timers stay ref'd and the
+  // process waits for SIGTERM/SIGKILL cleanup — preventing orphan hook children.
+  process.env.BOTMUX_DAEMON = '1';
+
   // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
   // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
   ensureCjkFontsInstalled();

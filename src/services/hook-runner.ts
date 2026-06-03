@@ -14,7 +14,6 @@ export const HOOK_EVENTS = [
   'session.exit',
   'session.idle',
   'session.requires_attention',
-  'session.error',
 ] as const;
 
 export type HookEvent = typeof HOOK_EVENTS[number];
@@ -167,6 +166,25 @@ export function prepareHookPayload(hook: HookConfig, rawPayload: HookPayload): H
     payload[truncatedKey] = true;
   }
 
+  // Truncate text/label string fields within optionsPreview array entries.
+  // The field name used by session.requires_attention (tui_prompt) is
+  // `optionsPreview`, not `options` — redact both for forward-compatibility.
+  for (const arrayField of ['options', 'optionsPreview'] as const) {
+    const arr = payload[arrayField];
+    if (!Array.isArray(arr)) continue;
+    payload[arrayField] = arr.map((item: unknown) => {
+      if (!item || typeof item !== 'object') return item;
+      const entry = item as Record<string, unknown>;
+      const out: Record<string, unknown> = { ...entry };
+      for (const key of ['text', 'label'] as const) {
+        if (typeof out[key] === 'string' && !allowFullContent && (out[key] as string).length > CONTENT_PREVIEW_LIMIT) {
+          out[key] = (out[key] as string).slice(0, CONTENT_PREVIEW_LIMIT);
+        }
+      }
+      return out;
+    });
+  }
+
   return payload;
 }
 
@@ -264,12 +282,21 @@ async function runHookCommand(hook: HookConfig, payload: HookPayload): Promise<H
       timedOut = true;
       try {
         child.kill('SIGTERM');
-        setTimeout(() => {
+        // WORKAROUND: In non-daemon (short-lived CLI) contexts the process
+        // exits before the unref'd SIGKILL backstop fires, leaving hook
+        // children as orphans. Keep this backstop ref'd so the CLI waits
+        // for cleanup. In daemon mode both timers are unref'd so the daemon
+        // event loop is not held open by hook timeouts.
+        const killTimer = setTimeout(() => {
           if (!settled) child.kill('SIGKILL');
-        }, 250).unref();
+        }, 250);
+        if (process.env.BOTMUX_DAEMON) killTimer.unref();
       } catch { /* process may already be gone */ }
     }, timeoutFor(hook));
-    timer.unref();
+    // In daemon mode, unref the timer so a hook timeout does not keep the
+    // daemon event loop alive. In CLI mode, keep it ref'd so the process
+    // waits for the SIGTERM/SIGKILL cleanup before exiting.
+    if (process.env.BOTMUX_DAEMON) timer.unref();
 
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', chunk => {

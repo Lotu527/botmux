@@ -141,6 +141,47 @@ describe('prepareHookPayload', () => {
     expect(payload.messageLength).toBe(601);
     expect(payload.messageTruncated).toBe(false);
   });
+
+  it('truncates text/label fields inside optionsPreview array entries', () => {
+    const longText = 'o'.repeat(650);
+
+    const payload = prepareHookPayload(
+      { event: 'session.requires_attention', command: '/bin/echo attention' },
+      {
+        event: 'session.requires_attention',
+        optionsPreview: [
+          { text: longText, label: 'short', type: 'choice', selected: false },
+          { text: 'ok', label: longText, selected: true },
+        ],
+      },
+    );
+
+    const preview = payload.optionsPreview as Array<Record<string, unknown>>;
+    expect(preview[0].text).toHaveLength(600);
+    expect(preview[0].label).toBe('short');
+    expect(preview[1].text).toBe('ok');
+    expect(preview[1].label).toHaveLength(600);
+  });
+
+  it('keeps optionsPreview text/label intact when event is allowlisted', () => {
+    const longText = 'o'.repeat(650);
+
+    const payload = prepareHookPayload(
+      {
+        event: 'session.requires_attention',
+        command: '/bin/echo attention',
+        redact: { fullContentEvents: ['session.requires_attention'] },
+      },
+      {
+        event: 'session.requires_attention',
+        optionsPreview: [{ text: longText, label: longText, selected: false }],
+      },
+    );
+
+    const preview = payload.optionsPreview as Array<Record<string, unknown>>;
+    expect(preview[0].text).toHaveLength(650);
+    expect(preview[0].label).toHaveLength(650);
+  });
 });
 
 describe('filterMatches', () => {
