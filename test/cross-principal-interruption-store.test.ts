@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD,
   continueCrossPrincipalOwnerWait,
   crossPrincipalInterruptionId,
   crossPrincipalOwnerWaitDisposition,
   markCrossPrincipalSuggestionWaiting,
+  noteCrossPrincipalProposer,
   stageCrossPrincipalInterruptionRecord,
 } from '../src/core/cross-principal-interruption-store.js';
 import type { Session, TrustedCaller } from '../src/types.js';
@@ -116,5 +118,45 @@ describe('cross-principal interruption durable identity', () => {
     continueCrossPrincipalOwnerWait(record, 20_000, 10_000);
     expect(record.ownerWaitDeadlineAt).toBe(30_000);
     expect(record.waitDecisionRound).toBe(1);
+  });
+});
+
+describe('bot↔bot auto-reply circuit breaker', () => {
+  it('never suppresses a human proposer and keeps the counter at zero', () => {
+    const source = session();
+    for (let i = 0; i < CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD + 5; i++) {
+      const guard = noteCrossPrincipalProposer(source, false);
+      expect(guard.suppressAckPrompt).toBe(false);
+      expect(guard.consecutiveBotInterruptions).toBe(0);
+    }
+    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(0);
+  });
+
+  it('suppresses only after more than the threshold consecutive bot proposers', () => {
+    const source = session();
+    for (let n = 1; n <= CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD; n++) {
+      const guard = noteCrossPrincipalProposer(source, true);
+      expect(guard.consecutiveBotInterruptions).toBe(n);
+      expect(guard.suppressAckPrompt).toBe(false);
+    }
+    const tripped = noteCrossPrincipalProposer(source, true);
+    expect(tripped.consecutiveBotInterruptions).toBe(CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD + 1);
+    expect(tripped.suppressAckPrompt).toBe(true);
+    // Stays tripped while the bot keeps interrupting.
+    expect(noteCrossPrincipalProposer(source, true).suppressAckPrompt).toBe(true);
+  });
+
+  it('a human proposer resets the counter so the next storm gets full runway again', () => {
+    const source = session();
+    for (let n = 0; n <= CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD; n++) noteCrossPrincipalProposer(source, true);
+    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD + 1);
+
+    // A person messaging mid-storm resets it.
+    expect(noteCrossPrincipalProposer(source, false).suppressAckPrompt).toBe(false);
+    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(0);
+
+    // The next bot interruption is treated as the start of a fresh sequence.
+    expect(noteCrossPrincipalProposer(source, true).suppressAckPrompt).toBe(false);
+    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(1);
   });
 });

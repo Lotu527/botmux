@@ -343,6 +343,18 @@ export interface Session {
    */
   crossPrincipalInterruptions?: CrossPrincipalInterruption[];
   /**
+   * Consecutive bot-proposer cross-principal interruptions on this session.
+   * Incremented each time a bot (never a human) interrupts the active turn and
+   * reset to 0 the moment a human interrupts. Once it crosses
+   * {@link CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD} the acknowledgement prompt is
+   * suppressed: the interruption is still staged durably, but botmux stops
+   * @-mentioning the bot proposer, breaking the mutual auto-reply storm where
+   * two `mentionMode: always` bots keep re-triggering each other's
+   * "请选择独立任务/建议" cards. Absent = 0. A human message resets it because a
+   * person choosing to keep messaging is not a runaway loop.
+   */
+  crossPrincipalConsecutiveBotInterruptions?: number;
+  /**
    * Narrow XPI fallback coordination for an independent child that could not
    * obtain an isolated worktree and therefore shares its source session's cwd.
    *
@@ -942,6 +954,15 @@ export interface CrossPrincipalInterruption {
    *  clocks are owned by the ask broker and start after card delivery. */
   ownerDeadlineAt?: number;
   messages: CrossPrincipalInterruptionMessage[];
+  /**
+   * Set when the bot↔bot auto-reply circuit breaker tripped for this record
+   * (more than {@link CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD} consecutive bot
+   * proposers). The record is still staged durably, but the drive loop resolves
+   * it silently — no classification card, no @-mention terminal notice — so two
+   * `mentionMode: always` bots stop re-triggering each other. Never set for a
+   * human proposer.
+   */
+  loopSuppressed?: boolean;
   independentRootMessageId?: string;
   independentChildSessionId?: string;
   independentWorkingDir?: string;
