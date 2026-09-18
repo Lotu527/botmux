@@ -18458,7 +18458,7 @@ async function stageCrossPrincipalInterruption(args: {
     // stays staged durably, but we skip the @-mention notice and let the drive
     // loop resolve it silently, so the storm dies. A human proposer resets the
     // counter (below), so this never affects people.
-    const loopGuard = noteCrossPrincipalProposer(ds.session, true);
+    const loopGuard = noteCrossPrincipalProposer(ds.session, proposer);
     if (loopGuard.suppressAckPrompt) {
       staged.record.loopSuppressed = true;
       staged.record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
@@ -18485,9 +18485,10 @@ async function stageCrossPrincipalInterruption(args: {
     scheduleCrossPrincipalOwnerWait(ds, staged.record.botClassifyDeadlineAt);
     return true;
   }
-  // A human proposer resets the bot-loop counter: a person choosing to keep
-  // messaging is never the runaway loop the breaker targets.
-  noteCrossPrincipalProposer(ds.session, false);
+  // A human proposer clears every bot's loop tally: a person choosing to keep
+  // messaging is never the runaway loop the breaker targets, and their turn is
+  // the natural signal that the room is sane again.
+  noteCrossPrincipalProposer(ds.session, proposer);
   void sessionReply(
     sessionAnchorId(ds),
     crossPrincipalStagedNotice(proposerOpenId, loc),

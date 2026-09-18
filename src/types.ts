@@ -343,17 +343,21 @@ export interface Session {
    */
   crossPrincipalInterruptions?: CrossPrincipalInterruption[];
   /**
-   * Consecutive bot-proposer cross-principal interruptions on this session.
-   * Incremented each time a bot (never a human) interrupts the active turn and
-   * reset to 0 the moment a human interrupts. Once it crosses
+   * Per-proposer count of consecutive bot cross-principal interruptions on this
+   * session, keyed by {@link crossPrincipalProposerKey} (lark app + the bot's
+   * own union/open id; unattributable senders share an `unknown` bucket). Each
+   * bot's tally is incremented when that bot (never a human) interrupts the
+   * active turn without classifying, and the whole map is cleared the moment any
+   * non-bot proposer interrupts. Once a bot's tally crosses
    * {@link CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD} the acknowledgement prompt is
-   * suppressed: the interruption is still staged durably, but botmux stops
-   * @-mentioning the bot proposer, breaking the mutual auto-reply storm where
-   * two `mentionMode: always` bots keep re-triggering each other's
-   * "请选择独立任务/建议" cards. Absent = 0. A human message resets it because a
-   * person choosing to keep messaging is not a runaway loop.
+   * suppressed for *that* bot: the interruption is still staged durably, but
+   * botmux stops @-mentioning it, breaking the mutual auto-reply storm where two
+   * `mentionMode: always` bots keep re-triggering each other's
+   * "请选择独立任务/建议" cards. Counting per proposer means an unrelated bot's
+   * first legitimate interruption is never dropped because a *different* bot was
+   * looping. Absent/empty = every bot at 0.
    */
-  crossPrincipalConsecutiveBotInterruptions?: number;
+  crossPrincipalBotInterruptionCounts?: Record<string, number>;
   /**
    * Narrow XPI fallback coordination for an independent child that could not
    * obtain an isolated worktree and therefore shares its source session's cwd.

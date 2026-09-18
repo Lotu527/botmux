@@ -122,57 +122,99 @@ describe('cross-principal interruption durable identity', () => {
 });
 
 describe('bot↔bot auto-reply circuit breaker', () => {
-  it('never suppresses a human proposer and keeps the counter at zero', () => {
+  const botA: TrustedCaller = {
+    requestUserOpenId: 'ou_bot_a',
+    requestUserUnionId: 'on_bot_a',
+    requestLarkAppId: 'app_test',
+    senderType: 'bot',
+  };
+  const botC: TrustedCaller = {
+    requestUserOpenId: 'ou_bot_c',
+    requestUserUnionId: 'on_bot_c',
+    requestLarkAppId: 'app_test',
+    senderType: 'bot',
+  };
+  const human: TrustedCaller = { ...owner, senderType: 'user' };
+
+  it('never suppresses a human proposer and keeps every tally at zero', () => {
     const source = session();
     for (let i = 0; i < CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD + 5; i++) {
-      const guard = noteCrossPrincipalProposer(source, false);
+      const guard = noteCrossPrincipalProposer(source, human);
       expect(guard.suppressAckPrompt).toBe(false);
       expect(guard.consecutiveBotInterruptions).toBe(0);
     }
-    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(0);
+    expect(source.crossPrincipalBotInterruptionCounts).toBeFalsy();
   });
 
-  it('suppresses only after more than the threshold consecutive bot proposers', () => {
+  it('suppresses only after more than the threshold interruptions from the same bot', () => {
     const source = session();
     for (let n = 1; n <= CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD; n++) {
-      const guard = noteCrossPrincipalProposer(source, true);
+      const guard = noteCrossPrincipalProposer(source, botA);
       expect(guard.consecutiveBotInterruptions).toBe(n);
       expect(guard.suppressAckPrompt).toBe(false);
     }
-    const tripped = noteCrossPrincipalProposer(source, true);
+    const tripped = noteCrossPrincipalProposer(source, botA);
     expect(tripped.consecutiveBotInterruptions).toBe(CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD + 1);
     expect(tripped.suppressAckPrompt).toBe(true);
-    // Stays tripped while the bot keeps interrupting.
-    expect(noteCrossPrincipalProposer(source, true).suppressAckPrompt).toBe(true);
+    // Stays tripped while the same bot keeps interrupting.
+    expect(noteCrossPrincipalProposer(source, botA).suppressAckPrompt).toBe(true);
   });
 
-  it('a human proposer resets the counter so the next storm gets full runway again', () => {
+  it('a human proposer clears the tally so the next storm gets full runway again', () => {
     const source = session();
-    for (let n = 0; n <= CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD; n++) noteCrossPrincipalProposer(source, true);
-    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD + 1);
+    for (let n = 0; n <= CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD; n++) noteCrossPrincipalProposer(source, botA);
+    expect(noteCrossPrincipalProposer(source, botA).suppressAckPrompt).toBe(true);
 
-    // A person messaging mid-storm resets it.
-    expect(noteCrossPrincipalProposer(source, false).suppressAckPrompt).toBe(false);
-    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(0);
+    // A person messaging mid-storm clears it.
+    expect(noteCrossPrincipalProposer(source, human).suppressAckPrompt).toBe(false);
+    expect(source.crossPrincipalBotInterruptionCounts).toBeFalsy();
 
     // The next bot interruption is treated as the start of a fresh sequence.
-    expect(noteCrossPrincipalProposer(source, true).suppressAckPrompt).toBe(false);
-    expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(1);
+    expect(noteCrossPrincipalProposer(source, botA).suppressAckPrompt).toBe(false);
   });
 
-  // Pins the ratified behaviour independently of the constant. The other cases
+  // The defect this fix targets (高志坤, 2026-09-18): with a single session-wide
+  // counter, an unrelated bot's FIRST legitimate interruption was suppressed
+  // merely because a different bot had already interrupted. Per-proposer keying
+  // must let bot C through on its first interruption even after bot A has
+  // tripped its own breaker.
+  it('does not penalise a second, distinct bot for the first bot\'s tally', () => {
+    const source = session();
+    // Bot A storms until it is suppressed.
+    expect(noteCrossPrincipalProposer(source, botA).suppressAckPrompt).toBe(false);
+    expect(noteCrossPrincipalProposer(source, botA).suppressAckPrompt).toBe(true);
+    // Bot C interrupts for the first time — must still get its one prompt.
+    const cFirst = noteCrossPrincipalProposer(source, botC);
+    expect(cFirst.consecutiveBotInterruptions).toBe(1);
+    expect(cFirst.suppressAckPrompt).toBe(false);
+    // C's own second interruption is suppressed (C is now the one looping);
+    // A remains suppressed independently.
+    expect(noteCrossPrincipalProposer(source, botC).suppressAckPrompt).toBe(true);
+    expect(noteCrossPrincipalProposer(source, botA).suppressAckPrompt).toBe(true);
+  });
+
+  // A bot proposer with no id at all collapses to a shared `unknown` bucket:
+  // still throttled (conservative), but never keyed as an identifiable bot.
+  it('throttles unattributable bot proposers via a shared unknown bucket', () => {
+    const source = session();
+    const anonBot: TrustedCaller = { requestLarkAppId: 'app_test', senderType: 'bot' };
+    expect(noteCrossPrincipalProposer(source, anonBot).suppressAckPrompt).toBe(false);
+    expect(noteCrossPrincipalProposer(source, anonBot).suppressAckPrompt).toBe(true);
+  });
+
+  // Pins the ratified threshold independently of the constant. The other cases
   // in this block loop over CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD, so they self-
   // adapt and stay green at any value; these literals fail if the threshold
-  // drifts off 1. Product decision (2026-09-18): the first bot interruption in
-  // a run gets exactly one prompt, every later one is silenced until a human
-  // breaks the run — larger values only emit noise cards.
+  // drifts off 1. Product decision (2026-09-18): the first interruption from a
+  // given bot gets exactly one prompt, every later one is silenced until a
+  // human breaks the run — larger values only emit noise cards.
   it('threshold is pinned to 1: prompt on the first bot interruption, suppress from the second', () => {
     expect(CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD).toBe(1);
     const source = session();
-    const first = noteCrossPrincipalProposer(source, true);
+    const first = noteCrossPrincipalProposer(source, botA);
     expect(first.consecutiveBotInterruptions).toBe(1);
     expect(first.suppressAckPrompt).toBe(false); // one prompt goes out
-    const second = noteCrossPrincipalProposer(source, true);
+    const second = noteCrossPrincipalProposer(source, botA);
     expect(second.consecutiveBotInterruptions).toBe(2);
     expect(second.suppressAckPrompt).toBe(true); // silenced from here on
   });
