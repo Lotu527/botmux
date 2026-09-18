@@ -159,4 +159,21 @@ describe('bot↔bot auto-reply circuit breaker', () => {
     expect(noteCrossPrincipalProposer(source, true).suppressAckPrompt).toBe(false);
     expect(source.crossPrincipalConsecutiveBotInterruptions).toBe(1);
   });
+
+  // Pins the ratified behaviour independently of the constant. The other cases
+  // in this block loop over CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD, so they self-
+  // adapt and stay green at any value; these literals fail if the threshold
+  // drifts off 1. Product decision (2026-09-18): the first bot interruption in
+  // a run gets exactly one prompt, every later one is silenced until a human
+  // breaks the run — larger values only emit noise cards.
+  it('threshold is pinned to 1: prompt on the first bot interruption, suppress from the second', () => {
+    expect(CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD).toBe(1);
+    const source = session();
+    const first = noteCrossPrincipalProposer(source, true);
+    expect(first.consecutiveBotInterruptions).toBe(1);
+    expect(first.suppressAckPrompt).toBe(false); // one prompt goes out
+    const second = noteCrossPrincipalProposer(source, true);
+    expect(second.consecutiveBotInterruptions).toBe(2);
+    expect(second.suppressAckPrompt).toBe(true); // silenced from here on
+  });
 });

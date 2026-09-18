@@ -14,15 +14,22 @@ export function crossPrincipalInterruptionId(sourceSessionId: string, turnId: st
 }
 
 /**
- * How many back-to-back bot-proposer interruptions are tolerated before the
- * acknowledgement prompt is suppressed. Two `mentionMode: always` bots can
- * otherwise ping-pong the "请选择独立任务/建议" card forever: each bot's card
- * @-mentions the other, whose auto-reply is itself a fresh cross-principal
- * message, and so on. A human proposer never counts toward this (and resets
- * it), so ordinary human interruptions are never suppressed. Three leaves room
- * for a legitimate handoff card + one bot follow-up before the breaker trips.
+ * How many consecutive bot-proposer interruptions still get the normal
+ * acknowledgement prompt before it is suppressed. Two `mentionMode: always`
+ * bots can otherwise ping-pong the "请选择独立任务/建议" card forever: each
+ * bot's card @-mentions the other, whose auto-reply is itself a fresh
+ * cross-principal message, and so on. A human proposer never counts toward
+ * this (and resets it), so ordinary human interruptions are never suppressed.
+ *
+ * Set to 1: only the first bot interruption in a consecutive run gets a prompt;
+ * every later one is silenced until a human breaks the run. (Suppression fires
+ * when the counter is strictly greater than this value — so `1` → prompt on the
+ * 1st bot interruption, suppress from the 2nd on.) The extra cards a larger
+ * value would emit are pure noise: a cooperating bot classifies via `--as`
+ * (which never advances this counter), and a bot that does not classify is the
+ * runaway loop this breaker exists to stop.
  */
-export const CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD = 3;
+export const CROSS_PRINCIPAL_BOT_LOOP_THRESHOLD = 1;
 
 /**
  * Update the consecutive-bot-interruption counter for a newly staged
