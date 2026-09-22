@@ -1,10 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AUTO_CLEANUP_TICK_MS,
   evaluateAutoCleanupDue,
   resolveCleanupHours,
   resolveCleanupIntervalMs,
   runAutoCleanupTick,
+  startAutoCleanup,
+  stopAutoCleanup,
   type AutoCleanupTickDeps,
 } from '../src/dashboard/auto-cleanup.js';
 import type { IdleCleanupSessionRow, IdleCleanupCloseResult } from '../src/dashboard/session-cleanup.js';
@@ -13,6 +15,11 @@ import type { SessionCleanupGlobalConfig } from '../src/global-config.js';
 const NOW = Date.UTC(2026, 5, 22, 12, 0, 0);
 const hour = 60 * 60 * 1000;
 const minute = 60 * 1000;
+
+afterEach(() => {
+  stopAutoCleanup();
+  vi.useRealTimers();
+});
 
 function row(id: string, patch: Record<string, unknown> = {}): IdleCleanupSessionRow & { larkAppId: string } {
   return {
@@ -146,6 +153,23 @@ describe('runAutoCleanupTick', () => {
     expect(getStored()).toBe(NOW);
   });
 
+  it('stamps the run before awaiting the first close', async () => {
+    const { deps, getStored } = makeDeps({ enabled: true, olderThanHours: 24 }, [row('slow')], undefined);
+    let resolveClose!: (result: IdleCleanupCloseResult) => void;
+    deps.closeCandidate = candidate => new Promise((resolve) => {
+      resolveClose = resolve;
+      expect(candidate.sessionId).toBe('slow');
+    });
+
+    const pending = runAutoCleanupTick(deps);
+
+    // This synchronous assertion pins the ordering contract: moving the stamp
+    // below cleanupIdleSessions would leave the old gate visible here.
+    expect(getStored()).toBe(NOW);
+    resolveClose({ sessionId: 'slow', ok: true });
+    await expect(pending).resolves.toMatchObject({ matched: 1, closed: 1 });
+  });
+
   it('reports partial failures without throwing', async () => {
     const rows = [row('a'), row('b'), row('c')];
     const { deps, closed } = makeDeps(
@@ -181,5 +205,53 @@ describe('runAutoCleanupTick', () => {
 
   it('exposes a sane tick cadence constant', () => {
     expect(AUTO_CLEANUP_TICK_MS).toBe(60_000);
+  });
+});
+
+describe('auto-cleanup timer lifecycle', () => {
+  it('clears both the startup delay and recurring timer when stopped', () => {
+    vi.useFakeTimers();
+    startAutoCleanup({
+      getSessions: () => [],
+      closeCandidate: async candidate => ({ sessionId: candidate.sessionId, ok: true }),
+    });
+    expect(vi.getTimerCount()).toBe(2);
+
+    stopAutoCleanup();
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not overlap a slow sweep with later interval ticks', async () => {
+    vi.useFakeTimers();
+    let now = NOW;
+    let closes = 0;
+    let resolveClose!: (result: IdleCleanupCloseResult) => void;
+    const closeCandidate = (candidate: IdleCleanupSessionRow) => {
+      closes += 1;
+      return new Promise<IdleCleanupCloseResult>((resolve) => {
+        resolveClose = resolve;
+        expect(candidate.sessionId).toBe('slow');
+      });
+    };
+    startAutoCleanup({
+      now: () => now,
+      readConfig: () => ({ enabled: true, olderThanHours: 24, intervalMinutes: 5 }),
+      getSessions: () => [row('slow')],
+      closeCandidate,
+    });
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(closes).toBe(1);
+    now += 6 * minute;
+    await vi.advanceTimersByTimeAsync(6 * minute);
+    expect(closes).toBe(1);
+
+    resolveClose({ sessionId: 'slow', ok: true });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(AUTO_CLEANUP_TICK_MS);
+    expect(closes).toBe(2);
+    resolveClose({ sessionId: 'slow', ok: true });
+    await vi.advanceTimersByTimeAsync(0);
   });
 });

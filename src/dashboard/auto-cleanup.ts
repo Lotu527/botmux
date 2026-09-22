@@ -133,6 +133,8 @@ export async function runAutoCleanupTick<T extends IdleCleanupSessionRow>(
 }
 
 let timer: NodeJS.Timeout | undefined;
+let startupTimer: NodeJS.Timeout | undefined;
+let sweepInFlight = false;
 let lastRunMs: number | undefined;
 
 /**
@@ -143,11 +145,14 @@ export function startAutoCleanup(deps: {
   getSessions: () => IdleCleanupSessionRow[];
   closeCandidate: (row: IdleCleanupSessionRow) => Promise<IdleCleanupCloseResult>;
   log?: (msg: string) => void;
+  /** Test seams; production uses the live clock and global config. */
+  now?: () => number;
+  readConfig?: () => SessionCleanupGlobalConfig | undefined;
 }): void {
-  if (timer) return;
+  if (timer || startupTimer) return;
   const tickDeps: AutoCleanupTickDeps<IdleCleanupSessionRow> = {
-    now: () => Date.now(),
-    readConfig: () => readGlobalConfig().sessionCleanup,
+    now: deps.now ?? (() => Date.now()),
+    readConfig: deps.readConfig ?? (() => readGlobalConfig().sessionCleanup),
     readLastRun: () => lastRunMs,
     writeLastRun: (ms) => { lastRunMs = ms; },
     getSessions: deps.getSessions,
@@ -155,22 +160,29 @@ export function startAutoCleanup(deps: {
     log: deps.log,
   };
   const tick = () => {
-    void runAutoCleanupTick(tickDeps).catch((e) => {
-      deps.log?.(`tick failed: ${e instanceof Error ? e.message : String(e)}`);
-    });
+    // The timestamp gate limits cadence, but a sweep can legitimately outlive
+    // the configured interval when it has many candidates. Keep one host-wide
+    // sweep in flight so later timer ticks never close the same rows again.
+    if (sweepInFlight) return;
+    sweepInFlight = true;
+    void runAutoCleanupTick(tickDeps)
+      .catch((e) => {
+        deps.log?.(`tick failed: ${e instanceof Error ? e.message : String(e)}`);
+      })
+      .finally(() => { sweepInFlight = false; });
   };
   // First check shortly after startup (so an already-enabled config sweeps
   // promptly), then on a steady cadence.
-  setTimeout(tick, 15_000).unref?.();
+  startupTimer = setTimeout(() => {
+    startupTimer = undefined;
+    tick();
+  }, 15_000);
+  startupTimer.unref?.();
   timer = setInterval(tick, AUTO_CLEANUP_TICK_MS);
   timer.unref?.();
 }
 
 export function stopAutoCleanup(): void {
+  if (startupTimer) { clearTimeout(startupTimer); startupTimer = undefined; }
   if (timer) { clearInterval(timer); timer = undefined; }
-}
-
-/** Test-only: reset the module-level run gate. */
-export function __resetAutoCleanupStateForTest(): void {
-  lastRunMs = undefined;
 }

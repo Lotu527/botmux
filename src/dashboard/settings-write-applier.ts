@@ -643,8 +643,8 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_sessionCleanup' };
     }
     const sc = raw as Record<string, unknown>;
-    // Merge over existing so a partial patch (e.g. just the toggle) keeps the
-    // other fields, and a future sibling key survives.
+    // Merge over the validated existing block so a partial patch (e.g. just the
+    // toggle) keeps the other supported fields.
     const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
     if ('enabled' in sc) {
       if (typeof sc.enabled !== 'boolean') {

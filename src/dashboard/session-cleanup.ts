@@ -2,6 +2,10 @@ import type { ParsedCloseResidual } from '../core/close-residual.js';
 export const IDLE_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
 export type IdleCleanupHours = typeof IDLE_CLEANUP_HOUR_OPTIONS[number];
 
+export function idleCleanupHoursLabel(hours: IdleCleanupHours): string {
+  return hours === 168 ? '7d' : `${hours}H`;
+}
+
 export interface IdleCleanupSessionRow {
   sessionId: string;
   status?: string;

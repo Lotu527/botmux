@@ -3154,7 +3154,7 @@ async function closeSessionsMatching(
       const upstream = await proxyToDaemon(
         s.larkAppId as string,
         `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-        { method: 'POST' },
+        { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
       );
       const text = await upstream.text();
       let body: any = null;
@@ -4329,7 +4329,7 @@ const server = createServer(async (req, res) => {
           const upstream = await proxyToDaemon(
             s.larkAppId as string,
             `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-            { method: 'POST' },
+            { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
           );
           const text = await upstream.text();
           let parsed: any = null;
@@ -8071,7 +8071,8 @@ listenWithProbe({
   // Scheduled auto-cleanup of idle sessions (config-gated, default OFF). Runs in
   // the dashboard process — the only one holding the cross-bot session view and
   // the per-bot close fan-out, and a single host-wide process (so no N-way
-  // duplication). The closer is byte-identical to the manual /cleanup-idle route.
+  // duplication). It shares the manual /cleanup-idle response handling and adds
+  // the same bounded close deadline used by the single-session action route.
   startAutoCleanup({
     getSessions: () => aggregator.getSessions(),
     closeCandidate: async (s) => {
@@ -8079,7 +8080,7 @@ listenWithProbe({
         const upstream = await proxyToDaemon(
           s.larkAppId ?? '',
           `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-          { method: 'POST' },
+          { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
         );
         const text = await upstream.text();
         let parsed: any = null;
