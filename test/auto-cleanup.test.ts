@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AUTO_CLEANUP_TICK_MS,
+  createAutoCleanupTickRunner,
   evaluateAutoCleanupDue,
   resolveCleanupHours,
   resolveCleanupIntervalMs,
@@ -221,37 +222,39 @@ describe('auto-cleanup timer lifecycle', () => {
 
     expect(vi.getTimerCount()).toBe(0);
   });
+});
 
-  it('does not overlap a slow sweep with later interval ticks', async () => {
-    vi.useFakeTimers();
+describe('auto-cleanup single-flight runner', () => {
+  it('does not overlap a slow sweep with a later due tick', async () => {
     let now = NOW;
+    let stored: number | undefined;
     let closes = 0;
-    let resolveClose!: (result: IdleCleanupCloseResult) => void;
-    const closeCandidate = (candidate: IdleCleanupSessionRow) => {
-      closes += 1;
-      return new Promise<IdleCleanupCloseResult>((resolve) => {
-        resolveClose = resolve;
-        expect(candidate.sessionId).toBe('slow');
-      });
-    };
-    startAutoCleanup({
+    const resolvers: Array<(result: IdleCleanupCloseResult) => void> = [];
+    const deps: AutoCleanupTickDeps<IdleCleanupSessionRow> = {
       now: () => now,
       readConfig: () => ({ enabled: true, olderThanHours: 24, intervalMinutes: 5 }),
+      readLastRun: () => stored,
+      writeLastRun: value => { stored = value; },
       getSessions: () => [row('slow')],
-      closeCandidate,
-    });
+      closeCandidate: candidate => {
+        closes += 1;
+        expect(candidate.sessionId).toBe('slow');
+        return new Promise(resolve => { resolvers.push(resolve); });
+      },
+    };
+    const runTick = createAutoCleanupTickRunner(deps);
 
-    await vi.advanceTimersByTimeAsync(15_000);
+    const first = runTick();
     expect(closes).toBe(1);
     now += 6 * minute;
-    await vi.advanceTimersByTimeAsync(6 * minute);
+    await expect(runTick()).resolves.toBeNull();
     expect(closes).toBe(1);
 
-    resolveClose({ sessionId: 'slow', ok: true });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(AUTO_CLEANUP_TICK_MS);
+    resolvers.shift()!({ sessionId: 'slow', ok: true });
+    await expect(first).resolves.toMatchObject({ matched: 1, closed: 1 });
+    const second = runTick();
     expect(closes).toBe(2);
-    resolveClose({ sessionId: 'slow', ok: true });
-    await vi.advanceTimersByTimeAsync(0);
+    resolvers.shift()!({ sessionId: 'slow', ok: true });
+    await expect(second).resolves.toMatchObject({ matched: 1, closed: 1 });
   });
 });

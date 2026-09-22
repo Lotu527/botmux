@@ -132,9 +132,27 @@ export async function runAutoCleanupTick<T extends IdleCleanupSessionRow>(
   return result;
 }
 
+/**
+ * Wrap a tick in a single-flight gate. Timer callbacks may arrive while a large
+ * sweep is still closing candidates; those overlapping callbacks resolve to
+ * null instead of starting a second sweep over the same rows.
+ */
+export function createAutoCleanupTickRunner<T extends IdleCleanupSessionRow>(
+  deps: AutoCleanupTickDeps<T>,
+): () => Promise<IdleCleanupResult | null> {
+  let active: Promise<IdleCleanupResult | null> | undefined;
+  return () => {
+    if (active) return Promise.resolve(null);
+    const run = runAutoCleanupTick(deps);
+    active = run;
+    return run.finally(() => {
+      if (active === run) active = undefined;
+    });
+  };
+}
+
 let timer: NodeJS.Timeout | undefined;
 let startupTimer: NodeJS.Timeout | undefined;
-let sweepInFlight = false;
 let lastRunMs: number | undefined;
 
 /**
@@ -145,31 +163,22 @@ export function startAutoCleanup(deps: {
   getSessions: () => IdleCleanupSessionRow[];
   closeCandidate: (row: IdleCleanupSessionRow) => Promise<IdleCleanupCloseResult>;
   log?: (msg: string) => void;
-  /** Test seams; production uses the live clock and global config. */
-  now?: () => number;
-  readConfig?: () => SessionCleanupGlobalConfig | undefined;
 }): void {
   if (timer || startupTimer) return;
   const tickDeps: AutoCleanupTickDeps<IdleCleanupSessionRow> = {
-    now: deps.now ?? (() => Date.now()),
-    readConfig: deps.readConfig ?? (() => readGlobalConfig().sessionCleanup),
+    now: () => Date.now(),
+    readConfig: () => readGlobalConfig().sessionCleanup,
     readLastRun: () => lastRunMs,
     writeLastRun: (ms) => { lastRunMs = ms; },
     getSessions: deps.getSessions,
     closeCandidate: deps.closeCandidate,
     log: deps.log,
   };
+  const runTick = createAutoCleanupTickRunner(tickDeps);
   const tick = () => {
-    // The timestamp gate limits cadence, but a sweep can legitimately outlive
-    // the configured interval when it has many candidates. Keep one host-wide
-    // sweep in flight so later timer ticks never close the same rows again.
-    if (sweepInFlight) return;
-    sweepInFlight = true;
-    void runAutoCleanupTick(tickDeps)
-      .catch((e) => {
-        deps.log?.(`tick failed: ${e instanceof Error ? e.message : String(e)}`);
-      })
-      .finally(() => { sweepInFlight = false; });
+    void runTick().catch((e) => {
+      deps.log?.(`tick failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
   };
   // First check shortly after startup (so an already-enabled config sweeps
   // promptly), then on a steady cadence.
