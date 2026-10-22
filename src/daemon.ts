@@ -408,7 +408,7 @@ import {
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
 } from './core/worker-pool.js';
-import { ensureServerThenReapOrphanTmuxServers } from './core/orphan-tmux-reaper.js';
+import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled } from './core/orphan-tmux-reaper.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import {
@@ -31326,8 +31326,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // "This conversation is open in another app" screen (measured: 19/48
   // sessions after one restart). This boots/identifies the reachable server,
   // terminates botmux-owned displaced ones, and releases the locks in time.
-  // See orphan-tmux-reaper.ts.
-  if (config.daemon.backendType === 'tmux') {
+  // See orphan-tmux-reaper.ts. Automatic process kill ⇒ default OFF: only runs
+  // when the machine-wide experimental Dashboard switch is enabled (global
+  // settings → 实验性配置), so an upgrade never starts signalling tmux servers
+  // without an operator opting in. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1 is the
+  // emergency kill-switch inside the reaper.
+  if (orphanTmuxReaperEnabled(config.daemon.backendType, config.reapOrphanTmuxServers)) {
     ensureServerThenReapOrphanTmuxServers();
   }
 

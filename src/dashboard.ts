@@ -1115,6 +1115,9 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  /** Experimental, default OFF: reap tmux servers orphaned by a previous
+   *  daemon generation at daemon startup (automatic process kill). */
+  reapOrphanTmuxServers: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
@@ -1746,6 +1749,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
