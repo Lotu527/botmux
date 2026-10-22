@@ -32,9 +32,13 @@
  *   • a DIFFERENT tmux process still holds a unix socket bound to the
  *     default socket pathname (kernel census: /proc/net/unix on Linux,
  *     lsof -U on macOS) — that is a displaced, unreachable server;
- *   • and it is provably botmux-spawned (booting argv carries
- *     `-s bmx-…` / `-s bmx-diag-…`, or a descendant pane carries
- *     `BOTMUX_MANAGED_SHELL=1`).
+ *   • and it is provably botmux-spawned: the server process's booting argv
+ *     carries `new-session -s bmx-…` / `bmx-diag-…` / `bmx-reap-bootstrap-…`
+ *     (Linux /proc/<pid>/cmdline and macOS `ps` both keep the first client's
+ *     argv for the server's whole lifetime). A server whose booting argv is a
+ *     user's own interactive session is never reaped even when botmux panes
+ *     later attach to it: on the shared default server its user sessions die
+ *     too, so the conservative choice is to leave it.
  *
  * Conservatism, matching reapOrphanWorkers():
  *   • Never reaps while the reachable server itself cannot be identified
@@ -46,6 +50,14 @@
  *     interactive tmux is left strictly alone.
  *   • Cross-daemon safe: several per-bot daemons share one host/tmux socket;
  *     a racing peer simply gets ESRCH on the kill.
+ *   • Default OFF: daemon.ts invokes this only when the machine-wide
+ *     experimental Dashboard switch is enabled. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
+ *     remains as an emergency kill-switch on top of that.
+ *   • SIGTERM is followed by a bounded liveness wait so restore cold-resumes
+ *     only after tmux's orderly pane teardown (which releases managed CLIs'
+ *     file locks); a server still alive at the deadline is left and reported,
+ *     never escalated to SIGKILL (the session-scope teardown on the recovery
+ *     path handles stragglers independently).
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -74,6 +86,15 @@ interface ReaperSeam {
    */
   reachableServerPid?: number | null;
   kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /** Liveness probe used for the bounded post-SIGTERM wait. Defaults to kill -0. */
+  isAlive?: (pid: number) => boolean;
+  /** Wait used by the post-SIGTERM bounded wait. Defaults to a synchronous sleep. */
+  sleep?: (ms: number) => void;
+  /** Second owner-pid probe for the TOCTOU guard. Tests inject it; defaults to a
+   *  fresh `tmux display-message` probe. */
+  reProbeReachableServerPid?: () => number | null;
+  /** First owner-pid probe. Tests inject it; defaults to a live tmux probe. */
+  probeReachableServerPid?: () => number | null;
   env?: NodeJS.ProcessEnv;
   uid?: number;
   platform?: NodeJS.Platform;
@@ -88,44 +109,23 @@ function isTmuxBinary(cmd: string): boolean {
  * The booting session of every botmux tmux server is named `bmx-<id>` /
  * `bmx-diag-<id>` (TmuxBackend.sessionName / diagnosticSessionName) and the
  * server inherits the first `tmux new-session -s bmx-…` client's argv on both
- * macOS and Linux (Linux only renames the thread COMM; /proc cmdline keeps the
- * original argv).
+ * macOS and Linux for its whole lifetime (Linux only renames the thread COMM;
+ * /proc cmdline keeps the original argv). The reaper's own one-shot bootstrap
+ * session (`ensureServerThenReapOrphanTmuxServers`) is included: it can itself
+ * boot a fresh server whose argv stays `bmx-reap-bootstrap-<pid>` forever
+ * (later real sessions attach, they do not change the server argv), so
+ * without this alternative a server the reaper booted would be unreapable
+ * after the next socket displacement.
  */
 export function argvCarriesBotmuxSession(cmd: string): boolean {
   // Require the `new-session` subcommand: a bare `-s` also belongs to grep,
   // tmux's own `kill-session -s`, etc., which must not match.
-  return /(?:^|\s)new-session\b.*\s-s\s+bmx(?:-diag)?-[0-9a-f]{8}(?:\s|$)/s.test(cmd);
+  return /(?:^|\s)new-session\b.*\s-s\s+(?:bmx(?:-diag)?-[0-9a-f]{8}|bmx-reap-bootstrap-\d+)(?:\s|$)/s.test(cmd);
 }
-
-/**
- * Botmux spawns every managed pane with `BOTMUX_MANAGED_SHELL=1` in the pane
- * command (see TmuxPipeBackend.createDetachedSession's wrapper argv). A user's
- * own interactive tmux never carries it.
- */
-const MANAGED_SHELL_MARKER = 'BOTMUX_MANAGED_SHELL=1';
 
 export function defaultSocketPath(env: NodeJS.ProcessEnv, uid: number): string {
   const baseDir = env.TMUX_TMPDIR || '/tmp';
   return join(baseDir, `tmux-${uid}`, 'default');
-}
-
-/** Set of every pid in `pid`'s descendant tree (not including pid itself). */
-export function descendantSet(pid: number, procs: ProcSnapshot[]): Set<number> {
-  const byParent = new Map<number, number[]>();
-  for (const p of procs) {
-    const list = byParent.get(p.ppid);
-    if (list) list.push(p.pid);
-    else byParent.set(p.ppid, [p.pid]);
-  }
-  const out = new Set<number>();
-  const stack = [...(byParent.get(pid) ?? [])];
-  while (stack.length > 0) {
-    const cur = stack.pop()!;
-    if (out.has(cur)) continue;
-    out.add(cur);
-    stack.push(...(byParent.get(cur) ?? []));
-  }
-  return out;
 }
 
 /**
@@ -226,6 +226,16 @@ function reachableTmuxServerPid(): number | null {
 }
 
 /**
+ * Daemon-startup gate. The reaper performs automatic process kills, so it runs
+ * only for the tmux backend AND the machine-wide experimental Dashboard switch
+ * (default OFF). The env kill-switch inside {@link reapOrphanTmuxServers} is a
+ * separate, independent layer.
+ */
+export function orphanTmuxReaperEnabled(backendType: string, featureEnabled: boolean): boolean {
+  return backendType === 'tmux' && featureEnabled;
+}
+
+/**
  * Ensure a reachable tmux server exists, then reap displaced botmux servers.
  *
  * At daemon startup no reachable server may exist (fresh reboot, or the
@@ -288,6 +298,17 @@ export function ensureServerThenReapOrphanTmuxServers(): number {
 }
 
 /**
+ * Bounded wait after SIGTERM for tmux's orderly shutdown (pane teardown is what
+ * releases managed CLIs' per-session file locks). The signal itself returning
+ * proves nothing — the server may still be closing panes when restore starts.
+ * A server still alive at the deadline is left running and reported; SIGKILL is
+ * deliberately not used because recovery's session-scope teardown handles
+ * straggler panes independently.
+ */
+const SERVER_EXIT_WAIT_TIMEOUT_MS = 3000;
+const SERVER_EXIT_WAIT_POLL_MS = 100;
+
+/**
  * Find and terminate botmux-owned tmux servers that no daemon can reach.
  *
  * Returns the number of servers reaped. Runs once at daemon startup (next to
@@ -308,7 +329,7 @@ export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
 
   const liveOwnerPid = opts.reachableServerPid !== undefined
     ? opts.reachableServerPid
-    : reachableTmuxServerPid();
+    : (opts.probeReachableServerPid ?? reachableTmuxServerPid)();
   // No reachable, positively-identified server ⇒ reap nothing. See the
   // backlog-overflow rationale on reachableTmuxServerPid().
   if (liveOwnerPid === null || liveOwnerPid === undefined) return 0;
@@ -341,8 +362,8 @@ export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
   // rebound) between the pid probe and the socket census. If its identity
   // changed, the candidates are no longer trustworthy — leave everything for
   // the next startup rather than risk a wrong kill.
-  if (opts.reachableServerPid === undefined) {
-    const ownerNow = reachableTmuxServerPid();
+  if (opts.reachableServerPid === undefined || opts.reProbeReachableServerPid !== undefined) {
+    const ownerNow = (opts.reProbeReachableServerPid ?? reachableTmuxServerPid)();
     if (ownerNow !== liveOwnerPid) {
       logger.warn(`[tmux-reaper] reachable server changed during reap (${liveOwnerPid} → ${ownerNow}); skipping this pass`);
       return 0;
@@ -350,17 +371,27 @@ export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
   }
 
   const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
+  const isAlive = opts.isAlive ?? ((pid) => {
+    try { process.kill(pid, 0); return true; }
+    catch (err) {
+      // EPERM means alive but not ours to signal — treat as alive (do not reap).
+      return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+    }
+  });
+  const sleep = opts.sleep ?? ((ms: number) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  });
   let reaped = 0;
   for (const pid of candidatePids) {
     const proc = procByPid.get(pid)!;
 
-    // Botmux fingerprint: the booting argv OR a managed pane descendant.
-    // Without one, a user's own displaced tmux is left strictly alone.
-    const managedDescendant = [...descendantSet(pid, procs)].some(d =>
-      procByPid.get(d)?.cmd.includes(MANAGED_SHELL_MARKER),
-    );
-    if (!argvCarriesBotmuxSession(proc.cmd) && !managedDescendant) continue;
+    // Botmux fingerprint: the server's booting argv. A user-booted server that
+    // later hosts attached bmx panes is deliberately NOT fingerprinted —
+    // killing it on the shared default socket would kill the user's sessions
+    // too. Without the fingerprint a displaced tmux is left strictly alone.
+    if (!argvCarriesBotmuxSession(proc.cmd)) continue;
 
+    let signaled: 'term' | 'esrch' | 'error' = 'term';
     try {
       // SIGTERM, not SIGKILL: tmux performs an orderly shutdown and closes
       // its panes itself, which releases the managed CLIs' per-session file
@@ -368,15 +399,39 @@ export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
       // inheriting a stale lock. Measured: the incident server (743
       // descendants) exited within seconds of SIGTERM.
       kill(pid, 'SIGTERM');
-      reaped += 1;
-      logger.warn(`[tmux-reaper] reaped orphaned tmux server pid=${pid}: unreachable on ${socketPath} but still hosting botmux sessions (previous daemon generation gone)`);
     } catch (err) {
       // ESRCH: it exited on its own / a peer daemon won the race — fine.
       const code = (err as NodeJS.ErrnoException)?.code;
-      if (code !== 'ESRCH') {
+      if (code === 'ESRCH') {
+        signaled = 'esrch';
+      } else {
+        signaled = 'error';
         logger.warn(`[tmux-reaper] failed to signal orphaned tmux server pid=${pid}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    if (signaled === 'error') continue;
+    if (signaled === 'esrch') {
+      reaped += 1;
+      continue;
+    }
+
+    // Bounded wait for the orderly teardown before restore cold-resumes managed
+    // CLIs (a pane ignoring SIGHUP can survive its server, in which case the
+    // lock is not released here; recovery's session-scope teardown is the
+    // independent backstop).
+    let alive = isAlive(pid);
+    let waited = 0;
+    while (alive && waited < SERVER_EXIT_WAIT_TIMEOUT_MS) {
+      sleep(SERVER_EXIT_WAIT_POLL_MS);
+      waited += SERVER_EXIT_WAIT_POLL_MS;
+      alive = isAlive(pid);
+    }
+    if (alive) {
+      logger.warn(`[tmux-reaper] orphaned tmux server pid=${pid} still alive ${SERVER_EXIT_WAIT_TIMEOUT_MS}ms after SIGTERM; leaving it for this pass (restore may contend on its CLI locks; session-scope teardown is the backstop)`);
+      continue;
+    }
+    reaped += 1;
+    logger.warn(`[tmux-reaper] reaped orphaned tmux server pid=${pid}: unreachable on ${socketPath} but still hosting botmux sessions (previous daemon generation gone)`);
   }
   if (reaped > 0) {
     logger.warn(`[tmux-reaper] reaped ${reaped} orphaned tmux server(s) from a previous daemon generation; managed CLI file locks released before session restore.`);
