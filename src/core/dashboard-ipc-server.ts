@@ -8,7 +8,7 @@ import { resolveWorkspace } from './workspace-metadata.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
-import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
+import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -1334,12 +1334,14 @@ async function handleManagedOriginAttestation(
   // authorization for this exact caller/turn, never a client-selected identity.
   let scheduleBot;
   try { scheduleBot = getBot(ds.larkAppId); } catch { /* unavailable => denied */ }
-  const scheduleCreator = authorizeOwnerlessScheduleCreator({
+  const scheduleCaller = {
     callerOpenId: origin.callerOpenId,
     allowedUsers: scheduleBot?.config.allowedUsers,
     resolvedAllowedUsers: scheduleBot?.resolvedAllowedUsers,
     resolutionCache: readAllowedUsersResolveCache(config.session.dataDir, ds.larkAppId),
-  });
+  };
+  const scheduleCreator = authorizeOwnerlessScheduleCreator(scheduleCaller);
+  const scheduleOperator = authorizeScheduleOperator(scheduleCaller);
   let proofPath: string;
   try {
     proofPath = writeManagedOriginAttestationProof({
@@ -1352,6 +1354,7 @@ async function handleManagedOriginAttestation(
         sessionId,
         turnId: liveTurnId,
         scheduleCreator,
+        scheduleOperator,
         ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
         larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
@@ -9803,7 +9806,10 @@ ipcRoute('PUT', '/api/bot-read-isolation', requireBoundBot(async (req, res) => {
           backendType,
           session.sessionId,
         );
-        const probe = backendType === 'zmx'
+        // tmux rows may be frozen onto the dedicated socket (`socketName`); a
+        // name-only probe would ask the default server and read a live pane as
+        // gone. Rows without it resolve to the historical default-server target.
+        const probe = backendType === 'zmx' || backendType === 'tmux'
           ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
             backendType, session.sessionId, session.persistentBackendTarget,
           ))

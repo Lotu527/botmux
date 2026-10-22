@@ -1308,8 +1308,9 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_command_only': '⚠️ Slash 命令未能确认送达 {cliName}。请检查当前终端状态后重发。',
   'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
-  'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
+  'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 Botmux 未能在该 structured CLI 的当前 turn 中匹配到最终文本或成功外发证据。如果你已看到 bot 发出的结果，可忽略本提示；否则请打开 Web 终端查看最后输出，或重发消息继续会话。',
   'worker.final_output_content_audit_blocked': '⚠️ 本轮回复被飞书内容安全审计拦截（错误码 {code}，通常因正文含邮箱、手机号、证件号等敏感信息），消息未送达，也不会按原内容自动重试。完整回答仍保留在 Web 终端中，可打开终端查看；如需发到群里，请脱敏（删除或打码敏感信息）后重发。',
+  'worker.final_output_card_rejected': '⚠️ 本轮回复卡片被飞书拒收（错误码 {code}）。已停止重复回传，会话仍可继续使用。完整回答保留在 Web 终端中，可打开查看或要求以纯文字重新发送。',
   'worker.bridge_restored_turn_notice': '⚠️ 本轮曾因 botmux 重启中断，以下是从终端记录恢复的该轮输出（可能不完整）：',
   'worker.restart_interrupted.note': '【botmux 提示】这个会话刚刚重启过：CLI 进程中途退出，已用原上下文恢复。{details}请先核对这些工作的实际状态（例如 CI、测试、子任务的结果），再继续没做完的事；仍需要的监控或后台任务要重新启动。',
   'worker.restart_interrupted.note_turn': '重启前你正在处理的那一轮还没做完。',
@@ -1958,6 +1959,7 @@ export const messages: Record<string, string> = {
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
+  'worker.claude_bridge_turn_unread': '⚠️ {cliName} 刚跑完一轮，但 botmux 没在它的会话记录（transcript）里读到这一轮，这一轮的回复可能不会自动转发到群里。请打开 Web 终端查看；之后在群里再发消息时，botmux 会重新定位会话记录。',
 
   // Restart / maintenance report (bot-0 DM to owner)
   'restart.updated_restarted': '🔄 **botmux 已更新并重启**',

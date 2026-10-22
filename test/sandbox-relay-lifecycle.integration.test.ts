@@ -165,6 +165,10 @@ setInterval(() => {}, 1 << 30);
   // moment the worker attaches pipe-pane, i.e. after its pane exists: the
   // post-spawn provenance commit then fails (a real post-spawn failure exit).
   const corruptProofFlag = join(dir, 'corrupt-proof-on-pipe-pane');
+  // `exitingServerOnPostKillProbe`: the first has-session after a kill meets
+  // the server while it is still exiting (killing its last session makes a
+  // tmux server exit), i.e. reads `server exited unexpectedly` once.
+  const exitingServerFlag = join(dir, 'exiting-server-on-post-kill-probe');
   const paneMarker = isolationPaneMarkerPath(dataDir, sessionId);
   writeFileSync(join(bin, 'tmux'), `#!/bin/sh
 if [ -e '${failNewSessionFlag}' ]; then
@@ -177,9 +181,19 @@ if [ -e '${failNewSessionFlag}' ]; then
 fi
 if [ -e '${failKillSessionFlag}' ]; then
   # Any kill: a plain kill-session, or the conditional one a retire sends.
-  if [ "$1" = if-shell ]; then echo 'if-shell refused by test' >&2; exit 1; fi
+  # Scan every argument: managed calls lead with the server (\`-L botmux\`).
   for arg in "$@"; do
+    if [ "$arg" = if-shell ]; then echo 'if-shell refused by test' >&2; exit 1; fi
     if [ "$arg" = kill-session ]; then echo 'kill-session refused by test' >&2; exit 1; fi
+  done
+fi
+if [ -e '${exitingServerFlag}' ]; then
+  for arg in "$@"; do
+    [ "$arg" = kill-session ] && : > '${exitingServerFlag}.killed'
+    if [ "$arg" = has-session ] && [ -e '${exitingServerFlag}.killed' ]; then
+      rm -f '${exitingServerFlag}' '${exitingServerFlag}.killed'; : > '${exitingServerFlag}.fired'
+      echo 'server exited unexpectedly' >&2; exit 1
+    fi
   done
 fi
 if [ -e '${corruptProofFlag}' ]; then
@@ -235,6 +249,9 @@ exec '${realTmux}' -S '${socket}' "$@"
     },
     failNewSession: (): void => writeFileSync(failNewSessionFlag, ''),
     corruptProofOnPipePane: (): void => writeFileSync(corruptProofFlag, ''),
+    exitingServerOnPostKillProbe: (): void => writeFileSync(exitingServerFlag, ''),
+    /** The injected `server exited unexpectedly` was actually answered. */
+    exitingServerProbeFired: (): boolean => existsSync(`${exitingServerFlag}.fired`),
     failKillSession: (on: boolean): void => {
       if (on) writeFileSync(failKillSessionFlag, '');
       else rmSync(failKillSessionFlag, { force: true });
@@ -530,8 +547,13 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
   // A crash keeps the tree for a successor (the pane survives). If the session
   // is closed before any successor attached, the daemon's worker-less close is
   // the only cleanup left: it must retire the pane, then tear the tree down
-  // with the flavour's own teardown (scratch: unmount first).
-  it.skipIf(!realTmux || !runtime)('tmux × worker crash, closed before a successor attached: the worker-less close tears the tree down', async () => {
+  // with the flavour's own teardown (scratch: unmount first). The kill takes
+  // the private server's last session, so the post-kill probe can meet that
+  // server mid-exit; that transient must not leave the tree behind.
+  it.skipIf(!realTmux || !runtime).each([
+    { variant: 'the worker-less close tears the tree down', serverExiting: false },
+    { variant: 'a post-kill probe that meets the exiting tmux server still tears the tree down', serverExiting: true },
+  ])('tmux × worker crash, closed before a successor attached: $variant', async ({ serverExiting }) => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
       const first = lab.start('boot-1', { crashHook: true });
@@ -548,7 +570,9 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
       expect(existsSync(lab.outbox), first.logs()).toBe(true);
       if (merged) expect(isMountpoint(merged)).toBe(true);
 
+      if (serverExiting) lab.exitingServerOnPostKillProbe();
       const closeLog = lab.closeWithoutWorker();
+      expect(lab.exitingServerProbeFired(), closeLog).toBe(serverExiting);
       expect(lab.paneAlive(), closeLog).toBe(false);
       expect(existsSync(lab.sessionRoot), closeLog).toBe(false);
       if (merged) {
