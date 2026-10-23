@@ -14,6 +14,7 @@ import {
   binaryProgressText,
 } from './update-action.js';
 import { ui } from './ui.js';
+import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -21,6 +22,8 @@ import {
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
+
+const GLOBAL_SESSION_ENV_SCOPE: SessionEnvScope = { kind: 'global' };
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -132,6 +135,7 @@ interface CliRuntimeUpdateStatus {
 interface UpdateStatus {
   current: string;
   latest: string | null;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
   behind: boolean;
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];
@@ -1113,6 +1117,12 @@ function SettingsBody(props: {
           />
         </SettingsBlock>
       </SettingsGroup>
+      {/* 表格型区块：不进上面的瀑布流窄栏，单独一组占满宽度。 */}
+      <SettingsGroup className="settings-group-session-env">
+        <SettingsBlock id="settings-session-env" title={tr('sessionEnv.sectionTitle')}>
+          <SessionEnvEditor scope={GLOBAL_SESSION_ENV_SCOPE} />
+        </SettingsBlock>
+      </SettingsGroup>
       </SettingsModule>
       <SettingsModule
         className="settings-module-meeting"
@@ -1266,6 +1276,7 @@ function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element 
       label: tr('settings.moduleGeneral'),
       items: [
         { id: 'settings-access', label: tr('settings.sectionAccess') },
+        { id: 'settings-session-env', label: tr('sessionEnv.sectionTitle') },
         { id: 'settings-cards', label: tr('settings.sectionCards') },
         { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
         { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
@@ -2227,10 +2238,15 @@ export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) 
   );
 }
 
-function UpdateBadge(props: { status: UpdateStatus }) {
+export function UpdateBadge(props: { status: UpdateStatus }) {
   const tr = useT();
   const s = props.status;
   if (!s.latest) return <span className="hint-warn-inline">{tr('update.checkUnavailable')}</span>;
+  if (s.latestSource === 'configured-fallback') {
+    return s.behind
+      ? <span className="update-badge update-badge-new">{tr('update.mirrorNewAvailable', { version: `v${s.latest}` })}</span>
+      : <span className="update-badge update-badge-ok">{tr('update.mirrorUpToDate')}</span>;
+  }
   return s.behind
     ? <span className="update-badge update-badge-new">{tr('update.newAvailable', { version: `v${s.latest}` })}</span>
     : <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>;

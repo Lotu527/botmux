@@ -61,7 +61,7 @@ import {
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
-import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
+import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
 import {
   decodeTerminalWriteFrameSource,
@@ -76,7 +76,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -170,6 +170,7 @@ import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, sh
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
+import { writeSessionEnvStamp } from './services/session-env-stamp.js';
 import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
 import { normalizeExistingAppServerEndpoint } from './core/existing-app-server.js';
 import { resolveChildBotsConfig } from './core/config-dir.js';
@@ -288,6 +289,7 @@ import {
   decideFingerprintSwitch,
   shouldHealAbsentBaseline,
   pidRotationHistoryCutoffMs,
+  shouldRecordPidStateSessionId,
   PENDING_MARK_SKEW_MS,
   sessionIdFromJsonlPath,
   SESSION_ID_FILENAME_RE,
@@ -1147,7 +1149,7 @@ async function codexRolloutProbe(cliId: string, threadId: string, promptText: st
 
 function codexNativeTitleEnv(cfg: Extract<DaemonToWorker, { type: 'init' }>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    ...buildSessionChildEnv(process.env, cfg.envPolicy),
+    ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset),
     ...botInjectedEnv(cfg.env, cfg.envPolicy),
   };
   env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
@@ -1338,7 +1340,7 @@ async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexR
     }
     const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
     const env: NodeJS.ProcessEnv = {
-      ...buildSessionChildEnv(process.env, cfg.envPolicy),
+      ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset),
       ...botInjectedEnv(cfg.env, cfg.envPolicy),
     };
     env.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), env.PATH);
@@ -1423,7 +1425,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     if (cfg.cliId === 'codex') {
       try { cliBin = realpathSync(resolvedCliBin); } catch { /* launch may resolve through engineEnv.PATH */ }
     }
-    const engineEnv: NodeJS.ProcessEnv = { ...buildSessionChildEnv(process.env, cfg.envPolicy) };
+    const engineEnv: NodeJS.ProcessEnv = { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset) };
     engineEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), engineEnv.PATH);
     engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;
     // In Codex/TraeX RPC mode the app-server, not the remote viewer TUI, runs
@@ -7821,10 +7823,14 @@ function maybeFollowQuietRotation(): void {
  *  `updatedAt` and `status` change but `sessionId` stays. So this probe
  *  catches spawn-time / `--resume` rotations; `/clear` (and in-pane
  *  `/resume` if Claude treats it the same) is left to the fingerprint
- *  fallback that anchors on a pending Lark turn. Returns a tri-state
- *  result rather than a bool so the caller can distinguish 'switched'
- *  (we moved) from 'same' (path confirmed) from 'unavailable' (no
- *  reliable answer) — the downstream gates use that distinction. */
+ *  fallback that anchors on a pending Lark turn. Claude Code 2.1.305+
+ *  rewrites it on `/clear`, in-pane `/resume` and `/branch` too (verified
+ *  on 2.1.308), so there this probe follows those moves by itself and
+ *  records the new id as the resume target (recordPidStateCliSessionId).
+ *  Returns a tri-state result rather than a bool so the caller can
+ *  distinguish 'switched' (we moved) from 'same' (path confirmed) from
+ *  'unavailable' (no reliable answer) — the downstream gates use that
+ *  distinction. */
 /** Tri-state result so callers can distinguish "pid file unreadable, fall
  *  back to fingerprint heuristic" from "pid file confirmed current path"
  *  vs "pid file said rotate to a new path".
@@ -7861,6 +7867,7 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   bridgeRememberSessionIdForPath(resolved.path);
   if (resolved.path === bridgeJsonlPath) {
     bridgePathConfirmedAtMs = Date.now();
+    recordPidStateCliSessionId(resolved);
     return 'same';
   }
   // Stale-pid suppression: when the fingerprint fallback accepted a
@@ -7882,7 +7889,23 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
     return 'same';
   }
   switchBridgeToPidStatePath(resolved.path, 'pid resolver', bridgePathConfirmedAtMs);
+  recordPidStateCliSessionId(resolved);
   return 'switched';
+}
+
+/** The bridge reads the transcript Claude's pid-state record names: make that
+ *  conversation the one a cold start resumes (see shouldRecordPidStateSessionId).
+ *  Never from a record the bridge has overridden as stale, nor from the
+ *  fingerprint / mtime fallbacks — those can land on a sibling pane's session. */
+function recordPidStateCliSessionId(resolved: { path: string; cliSessionId: string }): void {
+  if (!shouldRecordPidStateSessionId({
+    observedSessionId: resolved.cliSessionId,
+    resumeSessionId: lastInitConfig?.cliSessionId ?? sessionId,
+    adopted: lastInitConfig?.adoptMode === true,
+    transcriptResumable: () => transcriptHoldsConversation(resolved.path),
+  })) return;
+  log(`${cliName()} moved to session ${resolved.cliSessionId} (pid-state record); recording it as the resume target`);
+  persistCliSessionId(resolved.cliSessionId);
 }
 
 /** Move the bridge onto the transcript Claude's pid-state record names.
@@ -19089,6 +19112,23 @@ async function spawnCli(
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
   backend = selectedBackend.backend;
+  /**
+   * Liveness of a persistent pane this spawn has just killed (or is about to
+   * re-check after a kill) — the one entry every kill-then-confirm site below
+   * shares; only an authoritative `missing` proves it gone. tmux/zellij/herdr
+   * ask the exact target through the after-kill probe: killing the last
+   * session on a tmux server makes that server exit, and a probe meeting it
+   * mid-exit reads 'unknown', so only that answer is re-asked (bounded). ZMX
+   * keeps its owned probe (full sessionId + frozen PID): a target probe would
+   * silently degrade it to a name check.
+   */
+  const probePaneAfterKill = (name: string, target: PersistentBackendTarget | undefined): SessionProbe => (
+    effectiveBackendType === 'zmx'
+      ? probeOwnedZmxSession(name, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
+      : (target
+        ? probePersistentBackendTargetAfterKill(target)
+        : probePersistentSession(effectiveBackendType as PersistentBackendType, name))
+  );
   // BOT_HOME CLI-data redirect: sandboxed bots whose adapter supports it, plus
   // Codex bots explicitly requesting isolated auth, keep their CLI data
   // (transcripts/memory/auth) in their own BOT_HOME via
@@ -19483,11 +19523,7 @@ async function spawnCli(
         }
       },
       confirmPaneGone: () => {
-        const postKillProbe = effectiveBackendType === 'zmx'
-          ? probeOwnedZmxSession(staleSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
-          : (stalePersistentTarget
-            ? probePersistentBackendTarget(stalePersistentTarget)
-            : probePersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName));
+        const postKillProbe = probePaneAfterKill(staleSessionName, stalePersistentTarget);
         // Migration teardown fail-closes on ANY non-`missing` post-kill probe for
         // EVERY backend — not just ZMX. `exists` (kill didn't take) and `unknown`
         // (kill unconfirmed: tmux swallows kill errors incl. timeout, zellij does
@@ -19685,6 +19721,9 @@ async function spawnCli(
       // Confirm the stale pane is really gone before re-selecting. Re-selection
       // below decides reattach-vs-fresh from this probe, so an unconfirmed kill
       // would let the new backend reattach to the pane we just tried to remove.
+      // Deliberately not probePaneAfterKill: this gate only rejects a pane
+      // proven live (shouldRejectPersistentPostKillProbe), so a tmux server's
+      // mid-exit 'unknown' already reads as gone here — nothing to re-ask.
       const postKillProbe = effectiveBackendType === 'zmx'
         ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
         : (persistentTarget
@@ -19741,11 +19780,7 @@ async function spawnCli(
     } catch (err: any) {
       throw new Error(`${refusal}: could not kill stale pane (${err?.message ?? err})`);
     }
-    const postKillProbe = effectiveBackendType === 'zmx'
-      ? probeOwnedZmxSession(staleName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
-      : (persistentTarget
-        ? probePersistentBackendTarget(persistentTarget)
-        : probePersistentSession(persistentBackendType, staleName));
+    const postKillProbe = probePaneAfterKill(staleName, persistentTarget);
     if (postKillProbe !== 'missing') {
       throw new Error(
         `${refusal}: could not confirm stale ${effectiveBackendType} pane termination (post-kill probe: ${postKillProbe})`,
@@ -19953,7 +19988,7 @@ async function spawnCli(
   // adapter probe below queries the exact DB Hermes will `--resume` against.
   const hermesResumeStateDbPath = cfg.cliId === 'hermes'
     ? resolveHermesStateDbPath(
-      { ...buildSessionChildEnv(process.env, cfg.envPolicy), ...botInjectedEnv(cfg.env, cfg.envPolicy), BOTMUX_SESSION_ID: cfg.sessionId },
+      { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...botInjectedEnv(cfg.env, cfg.envPolicy), BOTMUX_SESSION_ID: cfg.sessionId },
       { botmuxSessionProfile: basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session' },
     )
     : undefined;
@@ -20429,7 +20464,7 @@ async function spawnCli(
   // bots.json on disk (im/lark/client.ts), `botmux ask` routes via the
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
-  const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy);
+  const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset);
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
   // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
   // The worker pin above is the single source for CLI and worker scratch.
@@ -20754,15 +20789,15 @@ async function spawnCli(
   const reproduceBaseArgs = [...spawnArgs];
 
   /** Liveness of this session's persistent pane, by its exact target. Only an
-   *  authoritative `missing` proves it gone (a PTY CLI never outlives its worker). */
+   *  authoritative `missing` proves it gone (a PTY CLI never outlives its worker).
+   *  Goes through the after-kill entry because most callers ask right after a
+   *  kill (a failed fresh launch's own retire, the Codex App generation kill;
+   *  the tree reconciliation follows the migration/retire above). A pane that
+   *  went away on its own only costs the bounded re-ask on an 'unknown'. */
   const probeOwnPersistentPane = (): string => {
     if (!persistentSessionName || effectiveBackendType === 'pty') return 'missing';
     try {
-      return effectiveBackendType === 'zmx'
-        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
-        : (selectedBackend.persistentBackendTarget
-          ? probePersistentBackendTarget(selectedBackend.persistentBackendTarget)
-          : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
+      return probePaneAfterKill(persistentSessionName, selectedBackend.persistentBackendTarget);
     } catch (probeErr) {
       return `unknown (${(probeErr as Error).message})`;
     }
@@ -22281,6 +22316,9 @@ async function spawnCli(
       rows: PTY_ROWS,
       env: childEnv as Record<string, string>,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
+      // Already removed from childEnv; shell-wrapped backends also `env -u`
+      // them after the pane's rcfile / terminal-server env (session env overlay).
+      unsetEnv: cfg.envUnset?.length ? cfg.envUnset : undefined,
       launchShell: lastInitConfig?.launchShell,
       strictEnv: cfg.envPolicy?.mode === 'strict',
       strictEnvReattach: willReattachPersistent,
@@ -22293,7 +22331,16 @@ async function spawnCli(
       modelBackendVariant: cfg.modelBackendVariant,
       reasoningEffort: cfg.reasoningEffort,
     });
-    if (!willReattachPersistent) writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
+    if (!willReattachPersistent) {
+      writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
+      // Which configured environment this CLI really got (Dashboard marks a
+      // running session whose stamp no longer matches the config). A reattach
+      // keeps the pane — and its env — so it keeps the old stamp.
+      if (cfg.envFingerprint) {
+        try { writeSessionEnvStamp(config.session.dataDir, cfg.sessionId, cfg.envFingerprint); }
+        catch (err: any) { log(`WARN session env stamp not written: ${err?.message ?? err}`); }
+      }
+    }
   } catch (err) {
     cleanupCodexAppControlBootstrap();
     programStatusRelayPlanCleanup?.();
@@ -22378,11 +22425,8 @@ async function spawnCli(
             + `could not kill the exact target (${killErr?.message ?? killErr}) — pending proof retained`,
           );
         }
-        const postKill = killKind === 'zmx'
-          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
-          : (killKind === 'target'
-            ? probePersistentBackendTarget(teardownTarget!)
-            : probePersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName));
+        // Same exact target the kill used: killKind 'target' ⟺ a recorded target.
+        const postKill = probePaneAfterKill(persistentSessionName, killKind === 'target' ? teardownTarget : undefined);
         if (postKill !== 'missing') {
           throw new Error(
             `[read-isolation] refusing to start session ${cfg.sessionId}: ${why}; `
@@ -27588,6 +27632,13 @@ process.on('message', async (raw: unknown) => {
       // 更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
       if (msg.env !== undefined && lastInitConfig) {
         lastInitConfig.env = msg.env === null ? undefined : msg.env;
+      }
+      // Session-env removals + fingerprint ride the same channel and tri-state.
+      if (msg.envUnset !== undefined && lastInitConfig) {
+        lastInitConfig.envUnset = msg.envUnset === null ? undefined : msg.envUnset;
+      }
+      if (msg.envFingerprint !== undefined && lastInitConfig) {
+        lastInitConfig.envFingerprint = msg.envFingerprint;
       }
       // model 热更，与 env 同一条通道、同一套三分态。model 不进冻结集合、每次
       // spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），但 live-worker
