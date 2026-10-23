@@ -408,7 +408,7 @@ import {
   buildStreamingCardJson,
   isResumeRecoveryPlaceholder,
 } from './core/worker-pool.js';
-import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled } from './core/orphan-tmux-reaper.js';
+import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import {
@@ -31332,7 +31332,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // without an operator opting in. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1 is the
   // emergency kill-switch inside the reaper.
   if (orphanTmuxReaperEnabled(config.daemon.backendType, config.reapOrphanTmuxServers)) {
-    ensureServerThenReapOrphanTmuxServers();
+    // Walk every socket an active persisted session is frozen to (undefined =
+    // default, 'botmux' = post-#2107 dedicated socket), plus the current
+    // preferred socket — a default-only census would reap nothing on hosts
+    // whose managed sessions were all created after socket isolation.
+    const recordedSocketNames = sessionStore.listSessions()
+      .filter(s => s.status === 'active' && (s.backendType ?? s.persistentBackendTarget?.backendType) === 'tmux')
+      .map(s => s.persistentBackendTarget?.backendType === 'tmux' ? s.persistentBackendTarget.socketName : undefined);
+    ensureServerThenReapOrphanTmuxServers({ socketNames: reaperCandidateSocketNames(recordedSocketNames) });
   }
 
   // Normalize legacy document-native watches before restore can close their old sessions.

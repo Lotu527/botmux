@@ -12,9 +12,9 @@
  *      tmux server keeps running with every managed pane in it.
  *   2. the new daemon's tmux traffic fails to reach the old server for any
  *      reason (probe timeout under load, socket path cleaned from /tmp, …)
- *      and a SECOND server is born, rebinding the default socket path. The
- *      old server keeps its unlinked socket and is now unreachable:
- *      `tmux list-sessions` cannot see it, so botmux can never manage or
+ *      and a SECOND server is born, rebinding the SAME socket path. The old
+ *      server keeps its unlinked socket and is now unreachable: `tmux -L
+ *      <name> list-sessions` cannot see it, so botmux can never manage or
  *      kill it again.
  *   3. the new daemon cold-resumes the restored sessions. Each managed CLI
  *      (e.g. codex) is a long-lived process inside the OLD server still
@@ -25,34 +25,59 @@
  *      tree leaked ~13 GB RSS and a few CLIs kept spinning on forked
  *      sub-threads.
  *
- * Because the old server is invisible on the socket, it is identified the
- * same way the incident was diagnosed live:
- *   • tmux list-sessions REACHES a live server — its pid is obtained from
- *     `tmux display-message -p '#{pid}'`;
- *   • a DIFFERENT tmux process still holds a unix socket bound to the
- *     default socket pathname (kernel census: /proc/net/unix on Linux,
- *     lsof -U on macOS) — that is a displaced, unreachable server;
+ * ─── Managed sockets (post-#2107) ───────────────────────────────────────────
+ *
+ * Managed sessions are frozen to a tmux socket name in
+ * `persistentBackendTarget.socketName`:
+ *   • `undefined` — the host DEFAULT server (`$TMUX_TMPDIR/tmux-<uid>/default`),
+ *     where every pre-#2107 record and /adopt live;
+ *   • `'botmux'` (DEFAULT_MANAGED_TMUX_SOCKET) — the dedicated, isolated
+ *     server (`$TMUX_TMPDIR/tmux-<uid>/botmux`) every NEW managed session
+ *     uses.
+ * The reaper MUST walk every socket a restored session can live on, not just
+ * the default — on a host that has only ever run #2107-or-newer builds the
+ * default socket hosts zero managed panes and a default-only census reaps
+ * nothing while the actual displaced `-L botmux` server keeps every lock.
+ *
+ * ─── Identification ────────────────────────────────────────────────────────
+ *
+ * Because the displaced server is invisible on the socket, it is identified
+ * the same way the incident was diagnosed live:
+ *   • a kernel census of unix listeners bound to the socket pathname
+ *     (/proc/net/unix on Linux, lsof -U on macOS — both keep reporting the
+ *     ORIGINAL bound pathname after unlink; verified on Linux 5.15 and macOS
+ *     tmux 3.6a);
+ *   • `tmux -L <name> display-message -p '#{pid}'` names the reachable owner;
+ *     any OTHER tmux process listening on the same pathname is displaced;
  *   • and it is provably botmux-spawned: the server process's booting argv
  *     carries `new-session -s bmx-…` / `bmx-diag-…` / `bmx-reap-bootstrap-…`
  *     (Linux /proc/<pid>/cmdline and macOS `ps` both keep the first client's
  *     argv for the server's whole lifetime). A server whose booting argv is a
  *     user's own interactive session is never reaped even when botmux panes
- *     later attach to it: on the shared default server its user sessions die
- *     too, so the conservative choice is to leave it.
+ *     later attach to it: on a shared socket its user sessions die too, so
+ *     the conservative choice is to leave it.
  *
- * Conservatism, matching reapOrphanWorkers():
- *   • Never reaps while the reachable server itself cannot be identified
- *     (probe timeout / spawn failure / connection-level errors). A busy
- *     server whose accept backlog momentarily overflows answers ECONNREFUSED;
- *     "can't tell" must never escalate into killing a live server, so the
- *     no-reachable-server branch reaps NOTHING.
+ * ─── Conservatism ──────────────────────────────────────────────────────────
+ *
+ *   • Census-first: a socket with NO listener in the kernel census is skipped
+ *     outright — no probe and, crucially on the default socket, no server is
+ *     ever booted just to probe (that would recreate the shared-server
+ *     footprint #2107 exists to remove). tmux does not auto-spawn a server on
+ *     a missing socket for display/list/has-session (verified: clean ENOENT),
+ *     so probing a populated path is side-effect-free; the ONLY place a server
+ *     may be booted is the disposable bootstrap, and only when a listener
+ *     already exists that no reachable owner answers for.
+ *   • Never reaps while the reachable owner cannot be identified (probe
+ *     timeout / spawn failure). A busy server's accept backlog can momentarily
+ *     answer ECONNREFUSED; "can't tell" never escalates into a kill.
  *   • Never reaps a process without a botmux fingerprint — a user's own
  *     interactive tmux is left strictly alone.
- *   • Cross-daemon safe: several per-bot daemons share one host/tmux socket;
- *     a racing peer simply gets ESRCH on the kill.
+ *   • Cross-daemon safe: several per-bot daemons share the hosts' tmux
+ *     sockets; per-pid bootstrap names avoid collisions, and racing peers
+ *     simply get ESRCH on the kill.
  *   • Default OFF: daemon.ts invokes this only when the machine-wide
- *     experimental Dashboard switch is enabled. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
- *     remains as an emergency kill-switch on top of that.
+ *     experimental Dashboard switch is enabled. BOTMUX_DISABLE_ORPHAN_TMUX_REAP
+ *     =1 remains an emergency kill-switch on top of that.
  *   • SIGTERM is followed by a bounded liveness wait so restore cold-resumes
  *     only after tmux's orderly pane teardown (which releases managed CLIs'
  *     file locks); a server still alive at the deadline is left and reported,
@@ -66,6 +91,11 @@ import { join, basename, dirname } from 'node:path';
 import type { ProcSnapshot } from './worker-pool.js';
 import { listProcesses } from './worker-pool.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
+import {
+  preferredManagedTmuxSocket,
+  managedTmuxCandidateSockets,
+  tmuxSocketArgs,
+} from '../adapters/backend/tmux-socket.js';
 import { logger } from '../utils/logger.js';
 
 /** A pid holding a unix socket bound to a pathname. */
@@ -75,14 +105,24 @@ export interface SocketBinding {
   path: string;
 }
 
+type SocketName = string | undefined;
+
+/** Result of a reachable-owner probe against one tmux socket. */
+type OwnerProbe =
+  | { kind: 'reachable'; pid: number }
+  | { kind: 'down' }
+  | { kind: 'unknown' };
+
 interface ReaperSeam {
   /** Live process table. Defaults to the shared {@link listProcesses}. */
   procs?: ProcSnapshot[];
   /** Pid → bound unix-socket pathnames. Defaults: /proc/net/unix, lsof. */
   socketBindings?: SocketBinding[];
   /**
-   * Pid of the tmux server answering on the default socket, or null when no
-   * reachable server can be identified (timeout / spawn failure).
+   * Pid of the tmux server answering on the DEFAULT socket, or null when no
+   * reachable server can be identified (timeout / spawn failure). Used ONLY by
+   * the back-compat single-socket {@link reapOrphanTmuxServers} entry point;
+   * the multi-socket orchestrator probes each socket itself.
    */
   reachableServerPid?: number | null;
   kill?: (pid: number, signal: NodeJS.Signals) => void;
@@ -91,10 +131,20 @@ interface ReaperSeam {
   /** Wait used by the post-SIGTERM bounded wait. Defaults to a synchronous sleep. */
   sleep?: (ms: number) => void;
   /** Second owner-pid probe for the TOCTOU guard. Tests inject it; defaults to a
-   *  fresh `tmux display-message` probe. */
-  reProbeReachableServerPid?: () => number | null;
+   *  fresh `tmux display-message` probe on the same socket. */
+  reProbeReachableServerPid?: (socketName: SocketName) => number | null;
   /** First owner-pid probe. Tests inject it; defaults to a live tmux probe. */
-  probeReachableServerPid?: () => number | null;
+  probeReachableServerPid?: (socketName: SocketName) => number | null;
+  /**
+   * Per-socket reachable-owner probe for the orchestrator: 'reachable' carries
+   * the pid; 'down' means tmux authoritatively answered "no server" (a bootstrap
+   * may boot one); 'unknown' is a timeout/spawn failure (skip this socket).
+   */
+  probeOwner?: (socketName: SocketName) => OwnerProbe;
+  /** Boot a disposable bootstrap session on the socket to pin a fresh owner. */
+  bootstrap?: (socketName: SocketName, sessionName: string) => boolean;
+  /** Remove a bootstrap session previously created on the socket. */
+  cleanupBootstrap?: (socketName: SocketName, sessionName: string) => void;
   env?: NodeJS.ProcessEnv;
   uid?: number;
   platform?: NodeJS.Platform;
@@ -111,11 +161,13 @@ function isTmuxBinary(cmd: string): boolean {
  * server inherits the first `tmux new-session -s bmx-…` client's argv on both
  * macOS and Linux for its whole lifetime (Linux only renames the thread COMM;
  * /proc cmdline keeps the original argv). The reaper's own one-shot bootstrap
- * session (`ensureServerThenReapOrphanTmuxServers`) is included: it can itself
- * boot a fresh server whose argv stays `bmx-reap-bootstrap-<pid>` forever
- * (later real sessions attach, they do not change the server argv), so
- * without this alternative a server the reaper booted would be unreapable
- * after the next socket displacement.
+ * session is included: it can itself boot a fresh server whose argv stays
+ * `bmx-reap-bootstrap-<pid>` forever (later real sessions attach, they do not
+ * change the server argv), so without this alternative a server the reaper
+ * booted would be unreapable after the next socket displacement.
+ *
+ * The fingerprint is socket-agnostic: it must match no matter which socket the
+ * booting `new-session` targeted (default / `-L botmux` / a recorded name).
  */
 export function argvCarriesBotmuxSession(cmd: string): boolean {
   // Require the `new-session` subcommand: a bare `-s` also belongs to grep,
@@ -123,15 +175,39 @@ export function argvCarriesBotmuxSession(cmd: string): boolean {
   return /(?:^|\s)new-session\b.*\s-s\s+(?:bmx(?:-diag)?-[0-9a-f]{8}|bmx-reap-bootstrap-\d+)(?:\s|$)/s.test(cmd);
 }
 
-export function defaultSocketPath(env: NodeJS.ProcessEnv, uid: number): string {
+/** Filesystem pathname of a tmux server socket (undefined name = default). */
+export function defaultSocketPath(
+  env: NodeJS.ProcessEnv,
+  uid: number,
+  socketName?: string,
+): string {
   const baseDir = env.TMUX_TMPDIR || '/tmp';
-  return join(baseDir, `tmux-${uid}`, 'default');
+  return join(baseDir, `tmux-${uid}`, socketName || 'default');
+}
+
+/**
+ * Every pathname a listener on `socketPath` might be reported under. macOS
+ * /tmp is a symlink to /private/tmp: tmux's bind(2) resolves it, so lsof
+ * reports the REAL path. realpath on the socket FILE itself fails with
+ * EOPNOTSUPP on macOS (it is not a regular file), so the parent DIRECTORY is
+ * canonicalized. On Linux /tmp is real and the two spellings coincide.
+ */
+function socketPathSpellings(socketPath: string): Set<string> {
+  try {
+    const real = join(realpathSync(dirname(socketPath)), basename(socketPath));
+    return new Set([socketPath, real]);
+  } catch {
+    return new Set([socketPath]);
+  }
 }
 
 /**
  * Linux: map pids to unix socket PATHNAMES they LISTEN on, via
  * /proc/net/unix (inode → pathname) + /proc/<pid>/fd/* (pid → inode).
  * Connected client endpoints have an empty Path column and never appear.
+ * A listener whose socket file was unlinked KEEPS its original bound pathname
+ * in /proc/net/unix (no "(deleted)" suffix on this kernel family) — this is
+ * what makes a displaced server visible to the census at all.
  */
 function linuxSocketBindings(): SocketBinding[] {
   const rows = readFileSync('/proc/net/unix', 'utf8').split('\n').slice(1);
@@ -165,7 +241,8 @@ function linuxSocketBindings(): SocketBinding[] {
  * macOS / other Unix: parse one `lsof -U -F pcn` dump. Records are `p<pid>`
  * then per-open-file lines (`f…`, `t…`, `n<name>`). A bound unix server
  * socket renders its absolute pathname; a connected client end renders
- * `->0x…`, which is filtered out.
+ * `->0x…`, which is filtered out. After unlink the listener KEEPS its
+ * original bound pathname (verified on macOS 15 / tmux 3.6a).
  */
 export function parseLsofSocketBindings(stdout: string): SocketBinding[] {
   const bindings: SocketBinding[] = [];
@@ -201,100 +278,73 @@ function defaultSocketBindings(platform: NodeJS.Platform): SocketBinding[] {
 }
 
 /**
- * Identify the tmux server currently answering on the default socket.
+ * Probe the tmux server currently answering on a socket.
  *
- * Returns its pid on a clean answer, or null when no reachable server can be
- * AUTHORITATIVELY identified — including a connection-level failure. tmux
- * returns an instant ECONNREFUSED when a healthy server's accept backlog
- * overflows; treating that as "down" would risk killing the live server, so
- * such states deliberately yield null (reap nothing).
+ * Returns a pid on a clean answer; 'down' on tmux's authoritative "no server
+ * on this socket" reply (ENOENT / no server running — no server is spawned by
+ * display-message on a missing socket, verified on tmux 3.3a and 3.6a);
+ * 'unknown' on a deadline or spawn failure — a healthy server's accept
+ * backlog can momentarily overflow into ECONNREFUSED, which must never be
+ * read as "down".
  */
-function reachableTmuxServerPid(): number | null {
-  let out: string;
+function probeOwnerOnSocket(socketName: SocketName): OwnerProbe {
   try {
-    out = execFileSync('tmux', ['display-message', '-p', '#{pid}'], {
+    const out = execFileSync('tmux', [...tmuxSocketArgs(socketName), 'display-message', '-p', '#{pid}'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
       env: tmuxEnv(),
       timeout: 3000,
     });
-  } catch {
-    return null;
+    const pid = Number(out.trim());
+    return Number.isInteger(pid) && pid > 0 ? { kind: 'reachable', pid } : { kind: 'unknown' };
+  } catch (e: any) {
+    if (e?.code === 'ETIMEDOUT' || e?.signal) return { kind: 'unknown' };
+    if (e && typeof e.status === 'number') return { kind: 'down' };
+    return { kind: 'unknown' };
   }
-  const pid = Number(out.trim());
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/** Back-compat single-socket pid probe (null collapses 'down' and 'unknown'). */
+function reachableTmuxServerPid(socketName: SocketName = undefined): number | null {
+  const r = probeOwnerOnSocket(socketName);
+  return r.kind === 'reachable' ? r.pid : null;
 }
 
 /**
  * Daemon-startup gate. The reaper performs automatic process kills, so it runs
  * only for the tmux backend AND the machine-wide experimental Dashboard switch
- * (default OFF). The env kill-switch inside {@link reapOrphanTmuxServers} is a
- * separate, independent layer.
+ * (default OFF). The env kill-switch inside the orchestrator is a separate,
+ * independent layer.
  */
 export function orphanTmuxReaperEnabled(backendType: string, featureEnabled: boolean): boolean {
   return backendType === 'tmux' && featureEnabled;
 }
 
-/**
- * Ensure a reachable tmux server exists, then reap displaced botmux servers.
- *
- * At daemon startup no reachable server may exist (fresh reboot, or the
- * previous generation's server lost its socket). A bare `tmux start-server`
- * cannot establish one durably: with the default `exit-empty on` the server
- * exits the moment the start-server client disconnects (zero sessions). A
- * disposable BOOTSTRAP session keeps it alive instead:
- *   • healthy existing server (graceful restart, socket intact): the
- *     `new-session` simply attaches to it — reachable pid is that server, no
- *     displaced holder exists, nothing is reaped;
- *   • displaced previous server (socket unlinked): the bootstrap boots a
- *     FRESH server at the default pathname — it becomes the reachable owner
- *     and the old server is now identifiable and reaped.
- *
- * The bootstrap is killed immediately afterwards; the server it pinned either
- * stays up (restored sessions are about to populate it) or exits empty (a
- * later new-session boots another fresh one, after the reap already finished).
- *
- * Returns the number of orphaned servers reaped. Runs synchronously and MUST
- * finish before restore cold-resumes managed CLIs, or those CLIs race the
- * displaced server's file locks and park on "open in another app".
- */
-export function ensureServerThenReapOrphanTmuxServers(): number {
-  if (process.platform !== 'linux' && process.platform !== 'darwin') return 0;
-  // Per-pid unique name: on a shared default socket several per-bot daemons
-  // boot concurrently (fleet upgrade) — a fixed name would make all but one
-  // get "duplicate session", and sweeping a fixed name could kill a peer's
-  // pin mid-reap. A crashed run leaves at most one harmless uniquely-named
-  // empty shell, never a collision.
-  const bootstrap = `bmx-reap-bootstrap-${process.pid}`;
-  let bootstrapped = false;
+const BOOTSTRAP_PREFIX = 'bmx-reap-bootstrap-';
+
+/** Create a disposable bootstrap session to pin a fresh reachable owner. */
+function bootstrapOwner(socketName: SocketName, sessionName: string): boolean {
   try {
-    execFileSync('tmux', ['new-session', '-d', '-s', bootstrap, '-x', '80', '-y', '24'], {
-      stdio: ['ignore', 'ignore', 'pipe'],
-      env: tmuxEnv(),
-      timeout: 5000,
-    });
-    bootstrapped = true;
+    execFileSync(
+      'tmux',
+      [...tmuxSocketArgs(socketName), 'new-session', '-d', '-s', sessionName, '-x', '80', '-y', '24'],
+      { stdio: ['ignore', 'ignore', 'pipe'], env: tmuxEnv(), timeout: 5000 },
+    );
+    return true;
   } catch (err) {
-    // Can't pin a reachable server (binary wedged, spawn failure, timeout) ⇒
-    // identity cannot be established ⇒ skip rather than risk a wrong reap.
-    logger.warn(`[tmux-reaper] tmux bootstrap failed, skipping orphan tmux reap: ${err instanceof Error ? err.message : String(err)}`);
-    return 0;
+    logger.warn(`[tmux-reaper] tmux bootstrap failed on ${socketName ?? 'default'}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
   }
-  let reaped = 0;
+}
+
+function removeBootstrap(socketName: SocketName, sessionName: string): void {
   try {
-    reaped = reapOrphanTmuxServers();
-  } finally {
-    if (bootstrapped) {
-      try {
-        execFileSync('tmux', ['kill-session', '-t', bootstrap], {
-          stdio: 'ignore',
-          env: tmuxEnv(),
-          timeout: 3000,
-        });
-      } catch { /* server already gone / concurrent cleanup — benign */ }
-    }
-  }
-  return reaped;
+    execFileSync('tmux', [...tmuxSocketArgs(socketName), 'kill-session', '-t', sessionName], {
+      stdio: 'ignore',
+      env: tmuxEnv(),
+      timeout: 3000,
+    });
+  } catch { /* server already gone / concurrent cleanup — benign */ }
 }
 
 /**
@@ -309,46 +359,26 @@ const SERVER_EXIT_WAIT_TIMEOUT_MS = 3000;
 const SERVER_EXIT_WAIT_POLL_MS = 100;
 
 /**
- * Find and terminate botmux-owned tmux servers that no daemon can reach.
- *
- * Returns the number of servers reaped. Runs once at daemon startup (next to
- * {@link import('./worker-pool.js').reapOrphanWorkers}), BEFORE session
- * restore/cold-resume, so the resumed managed CLIs acquire their file locks
- * instead of inheriting the displaced server's. Idempotent and safe for the
- * multi-daemon-per-host layout.
- *
- * Disable with BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1.
+ * Core single-socket reap: given the reachable owner pid, terminate every
+ * OTHER botmux-fingerprinted tmux process listening on that socket's
+ * pathnames. Shared by the multi-socket orchestrator and the back-compat
+ * {@link reapOrphanTmuxServers} entry point.
  */
-export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
-  const env = opts.env ?? process.env;
-  if (env.BOTMUX_DISABLE_ORPHAN_TMUX_REAP === '1') return 0;
-  const platform = opts.platform ?? process.platform;
-  if (platform !== 'linux' && platform !== 'darwin') return 0;
-  const uid = opts.uid ?? (typeof process.getuid === 'function' ? process.getuid() : -1);
-  if (uid < 0) return 0;
-
-  const liveOwnerPid = opts.reachableServerPid !== undefined
-    ? opts.reachableServerPid
-    : (opts.probeReachableServerPid ?? reachableTmuxServerPid)();
-  // No reachable, positively-identified server ⇒ reap nothing. See the
-  // backlog-overflow rationale on reachableTmuxServerPid().
-  if (liveOwnerPid === null || liveOwnerPid === undefined) return 0;
-
-  const socketPath = defaultSocketPath(env, uid);
-  // macOS /tmp is a symlink to /private/tmp: tmux's bind(2) resolves it, so
-  // the kernel census (lsof, /proc/net/unix) reports the REAL path. Canonicalize
-  // the parent DIRECTORY (realpath on the socket file itself fails with
-  // EOPNOTSUPP on macOS) and compare against both spellings.
-  let socketReal: string | null = null;
-  try { socketReal = join(realpathSync(dirname(socketPath)), basename(socketPath)); } catch { /* — */ }
-  const socketPaths = new Set(socketReal ? [socketPath, socketReal] : [socketPath]);
-  const bindings = opts.socketBindings ?? defaultSocketBindings(platform);
-  if (bindings.length === 0) return 0;
-  const procs = opts.procs ?? listProcesses();
+function reapSocketOrphans(opts: {
+  socketName: SocketName;
+  liveOwnerPid: number;
+  socketPaths: Set<string>;
+  bindings: SocketBinding[];
+  procs: ProcSnapshot[];
+  kill: (pid: number, signal: NodeJS.Signals) => void;
+  isAlive: (pid: number) => boolean;
+  sleep: (ms: number) => void;
+  reProbe: () => number | null;
+  socketPathForLog: string;
+}): number {
+  const { socketName, liveOwnerPid, socketPaths, bindings, procs, socketPathForLog } = opts;
   const procByPid = new Map(procs.map(p => [p.pid, p]));
 
-  // Distinct tmux processes LISTENING on the default socket pathname. The
-  // reachable owner is one of them; any other is a displaced orphan.
   const candidatePids = new Set<number>();
   for (const b of bindings) {
     if (!socketPaths.has(b.path)) continue;
@@ -362,45 +392,29 @@ export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
   // rebound) between the pid probe and the socket census. If its identity
   // changed, the candidates are no longer trustworthy — leave everything for
   // the next startup rather than risk a wrong kill.
-  if (opts.reachableServerPid === undefined || opts.reProbeReachableServerPid !== undefined) {
-    const ownerNow = (opts.reProbeReachableServerPid ?? reachableTmuxServerPid)();
-    if (ownerNow !== liveOwnerPid) {
-      logger.warn(`[tmux-reaper] reachable server changed during reap (${liveOwnerPid} → ${ownerNow}); skipping this pass`);
-      return 0;
-    }
+  const ownerNow = opts.reProbe();
+  if (ownerNow !== liveOwnerPid) {
+    logger.warn(`[tmux-reaper] reachable server changed during reap on ${socketName ?? 'default'} (${liveOwnerPid} → ${ownerNow}); skipping this pass`);
+    return 0;
   }
 
-  const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
-  const isAlive = opts.isAlive ?? ((pid) => {
-    try { process.kill(pid, 0); return true; }
-    catch (err) {
-      // EPERM means alive but not ours to signal — treat as alive (do not reap).
-      return (err as NodeJS.ErrnoException)?.code === 'EPERM';
-    }
-  });
-  const sleep = opts.sleep ?? ((ms: number) => {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  });
   let reaped = 0;
   for (const pid of candidatePids) {
     const proc = procByPid.get(pid)!;
 
     // Botmux fingerprint: the server's booting argv. A user-booted server that
     // later hosts attached bmx panes is deliberately NOT fingerprinted —
-    // killing it on the shared default socket would kill the user's sessions
-    // too. Without the fingerprint a displaced tmux is left strictly alone.
+    // killing it on a shared socket would kill the user's sessions too.
     if (!argvCarriesBotmuxSession(proc.cmd)) continue;
 
     let signaled: 'term' | 'esrch' | 'error' = 'term';
     try {
-      // SIGTERM, not SIGKILL: tmux performs an orderly shutdown and closes
-      // its panes itself, which releases the managed CLIs' per-session file
-      // locks — cold-resumed sessions then recover immediately instead of
-      // inheriting a stale lock. Measured: the incident server (743
-      // descendants) exited within seconds of SIGTERM.
-      kill(pid, 'SIGTERM');
+      // SIGTERM, not SIGKILL: tmux performs an orderly shutdown and closes its
+      // panes itself, which releases the managed CLIs' per-session file locks
+      // — cold-resumed sessions then recover immediately. Measured: the
+      // incident server (743 descendants) exited within seconds of SIGTERM.
+      opts.kill(pid, 'SIGTERM');
     } catch (err) {
-      // ESRCH: it exited on its own / a peer daemon won the race — fine.
       const code = (err as NodeJS.ErrnoException)?.code;
       if (code === 'ESRCH') {
         signaled = 'esrch';
@@ -419,22 +433,191 @@ export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
     // CLIs (a pane ignoring SIGHUP can survive its server, in which case the
     // lock is not released here; recovery's session-scope teardown is the
     // independent backstop).
-    let alive = isAlive(pid);
+    let alive = opts.isAlive(pid);
     let waited = 0;
     while (alive && waited < SERVER_EXIT_WAIT_TIMEOUT_MS) {
-      sleep(SERVER_EXIT_WAIT_POLL_MS);
+      opts.sleep(SERVER_EXIT_WAIT_POLL_MS);
       waited += SERVER_EXIT_WAIT_POLL_MS;
-      alive = isAlive(pid);
+      alive = opts.isAlive(pid);
     }
     if (alive) {
       logger.warn(`[tmux-reaper] orphaned tmux server pid=${pid} still alive ${SERVER_EXIT_WAIT_TIMEOUT_MS}ms after SIGTERM; leaving it for this pass (restore may contend on its CLI locks; session-scope teardown is the backstop)`);
       continue;
     }
     reaped += 1;
-    logger.warn(`[tmux-reaper] reaped orphaned tmux server pid=${pid}: unreachable on ${socketPath} but still hosting botmux sessions (previous daemon generation gone)`);
-  }
-  if (reaped > 0) {
-    logger.warn(`[tmux-reaper] reaped ${reaped} orphaned tmux server(s) from a previous daemon generation; managed CLI file locks released before session restore.`);
+    logger.warn(`[tmux-reaper] reaped orphaned tmux server pid=${pid}: unreachable on ${socketPathForLog} (socket ${socketName ?? 'default'}) but still hosting botmux sessions (previous daemon generation gone)`);
   }
   return reaped;
+}
+
+/**
+ * Back-compat single-socket entry point (DEFAULT socket). Kept for callers and
+ * the unit tests that pin one reachable pid via the seam; the daemon uses the
+ * multi-socket {@link ensureServerThenReapOrphanTmuxServers}.
+ */
+export function reapOrphanTmuxServers(opts: ReaperSeam = {}): number {
+  const env = opts.env ?? process.env;
+  if (env.BOTMUX_DISABLE_ORPHAN_TMUX_REAP === '1') return 0;
+  const platform = opts.platform ?? process.platform;
+  if (platform !== 'linux' && platform !== 'darwin') return 0;
+  const uid = opts.uid ?? (typeof process.getuid === 'function' ? process.getuid() : -1);
+  if (uid < 0) return 0;
+
+  const liveOwnerPid = opts.reachableServerPid !== undefined
+    ? opts.reachableServerPid
+    : (opts.probeReachableServerPid ?? reachableTmuxServerPid)(undefined);
+  if (liveOwnerPid === null || liveOwnerPid === undefined) return 0;
+
+  const socketPath = defaultSocketPath(env, uid, undefined);
+  const bindings = opts.socketBindings ?? defaultSocketBindings(platform);
+  if (bindings.length === 0) return 0;
+  const procs = opts.procs ?? listProcesses();
+  const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
+  const isAlive = opts.isAlive ?? defaultIsAlive;
+  const sleep = opts.sleep ?? defaultSleep;
+
+  return reapSocketOrphans({
+    socketName: undefined,
+    liveOwnerPid,
+    socketPaths: socketPathSpellings(socketPath),
+    bindings,
+    procs,
+    kill,
+    isAlive,
+    sleep,
+    socketPathForLog: socketPath,
+    reProbe: () => {
+      if (opts.reachableServerPid === undefined || opts.reProbeReachableServerPid !== undefined) {
+        return (opts.reProbeReachableServerPid ?? reachableTmuxServerPid)(undefined);
+      }
+      return liveOwnerPid;
+    },
+  });
+}
+
+function defaultIsAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (err) {
+    // EPERM means alive but not ours to signal — treat as alive (do not reap).
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+function defaultSleep(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Sockets the daemon walks at startup: every socket a persisted ACTIVE tmux
+ * session is frozen to, plus the default socket (legacy / #2107-prior records
+ * and /adopt) and the current preferred managed socket (new sessions).
+ */
+export function reaperCandidateSocketNames(
+  recordedSocketNames: Iterable<string | undefined>,
+  env: NodeJS.ProcessEnv = process.env,
+): Array<string | undefined> {
+  const out: Array<string | undefined> = [];
+  const push = (name: string | undefined) => { if (!out.includes(name)) out.push(name); };
+  for (const name of recordedSocketNames) push(name);
+  for (const name of managedTmuxCandidateSockets(undefined, preferredManagedTmuxSocket(env))) push(name);
+  return out;
+}
+
+/**
+ * Multi-socket daemon-startup entry point.
+ *
+ * For each candidate socket (default + dedicated + any per-session frozen
+ * name):
+ *   1. kernel census of listeners bound to its pathname — NONE ⇒ skip without
+ *      probing or booting anything (census-first, no shared-server churn);
+ *   2. probe the reachable owner (`tmux -L <name> display-message`);
+ *      • reachable → reap displaced listeners against it;
+ *      • tmux-authoritative "down" WITH a listener present ⇒ a displaced,
+ *        unreachable server exists: boot a disposable per-pid-named bootstrap
+ *        session to pin a fresh reachable owner (a bare `tmux start-server`
+ *        cannot pin: exit-empty=on kills it on client disconnect), re-probe,
+ *        reap, then remove the bootstrap;
+ *      • unknown (timeout / spawn failure) ⇒ skip this socket.
+ *
+ * `socketNames` defaults to the production candidate set; tests inject a seam
+ * object for every side-effecting operation. Returns servers reaped.
+ */
+export function ensureServerThenReapOrphanTmuxServers(
+  opts: ReaperSeam & { socketNames?: Array<string | undefined> } = {},
+): number {
+  const env = opts.env ?? process.env;
+  if (env.BOTMUX_DISABLE_ORPHAN_TMUX_REAP === '1') return 0;
+  const platform = opts.platform ?? process.platform;
+  if (platform !== 'linux' && platform !== 'darwin') return 0;
+  const uid = opts.uid ?? (typeof process.getuid === 'function' ? process.getuid() : -1);
+  if (uid < 0) return 0;
+
+  const socketNames = opts.socketNames
+    ?? reaperCandidateSocketNames([], env);
+  const bindings = opts.socketBindings ?? defaultSocketBindings(platform);
+  const procs = opts.procs ?? listProcesses();
+  const probeOwner = opts.probeOwner ?? probeOwnerOnSocket;
+  const bootstrap = opts.bootstrap ?? bootstrapOwner;
+  const cleanupBootstrap = opts.cleanupBootstrap ?? removeBootstrap;
+  const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
+  const isAlive = opts.isAlive ?? defaultIsAlive;
+  const sleep = opts.sleep ?? defaultSleep;
+
+  let total = 0;
+  for (const socketName of socketNames) {
+    const socketPath = defaultSocketPath(env, uid, socketName);
+    const socketPaths = socketPathSpellings(socketPath);
+    const listeners = bindings.filter(b => socketPaths.has(b.path));
+
+    // Census-first: nothing bound on this pathname ⇒ no server to identify and
+    // no orphan to reap. Never boot a server here — on the default socket that
+    // would recreate exactly the shared footprint #2107 removed, and on any
+    // socket it would be a boot with nothing to reclaim (restore itself
+    // replaces a stale/absent socket the normal way on first new-session).
+    if (listeners.length === 0) continue;
+
+    let owner = probeOwner(socketName);
+    let bootstrappedSession: string | null = null;
+    if (owner.kind === 'unknown') {
+      logger.warn(`[tmux-reaper] owner probe inconclusive on ${socketName ?? 'default'}; skipping this socket`);
+      continue;
+    }
+    if (owner.kind === 'down') {
+      // A listener exists but no reachable owner answers — the displaced
+      // server scenario. Pin a fresh owner with a bootstrap session.
+      bootstrappedSession = `${BOOTSTRAP_PREFIX}${process.pid}`;
+      if (!bootstrap(socketName, bootstrappedSession)) continue;
+      const reProbed = probeOwner(socketName);
+      if (reProbed.kind !== 'reachable') {
+        cleanupBootstrap(socketName, bootstrappedSession);
+        logger.warn(`[tmux-reaper] fresh owner unreachable after bootstrap on ${socketName ?? 'default'}; skipping this socket`);
+        continue;
+      }
+      owner = reProbed;
+    }
+
+    try {
+      total += reapSocketOrphans({
+        socketName,
+        liveOwnerPid: owner.pid,
+        socketPaths,
+        bindings: listeners,
+        procs,
+        kill,
+        isAlive,
+        sleep,
+        socketPathForLog: socketPath,
+        reProbe: () => {
+          const r = probeOwner(socketName);
+          return r.kind === 'reachable' ? r.pid : null;
+        },
+      });
+    } finally {
+      if (bootstrappedSession) cleanupBootstrap(socketName, bootstrappedSession);
+    }
+  }
+  if (total > 0) {
+    logger.warn(`[tmux-reaper] reaped ${total} orphaned tmux server(s) from a previous daemon generation; managed CLI file locks released before session restore.`);
+  }
+  return total;
 }
